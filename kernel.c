@@ -287,13 +287,14 @@ static void cmd_halt(void);
 static void cmd_mkpan(void);
 static void cmd_kpc(void);
 static void reboot(void);
+static void echo(void);
 
 static void cmd_mkpan(void) {
     kernel_panic("The SilkOS Kernel has had a fatal error and cannot recover: 0x001");
 }
 
 static void cmd_kpc(void) {
-    vga_puts("Kernel Panic Codes:\n0x001: Manually Triggered Panic\n");
+    vga_puts("Kernel Panic Codes:\n0x001: Manually Triggered Panic\n0x002: Failed Reboot\n");
 }
 
 static void cmd_reboot(void) {
@@ -308,8 +309,136 @@ static void cmd_reboot(void) {
     outb(0x64, 0xFE);
 
     // If the above didn't work, triple-fault as a fallback
-    kernel_panic("Reboot failed — could not reset via keyboard controller.");
+    kernel_panic("The SilkOS Kernel has had a fatal error and cannot recover: 0x002");
 }
+static const char *cmd_args = "";
+
+static void cmd_echo(void) {
+    vga_puts("\n  ");
+    vga_set_color(CLR_WHITE, CLR_BLACK);
+    vga_puts(cmd_args);
+    vga_puts("\n");
+    vga_set_color(CLR_LGRAY, CLR_BLACK);
+}
+
+// ── clear ────────────────────────────────────────────────────────
+// Wipes the screen by re-initialising the VGA driver.
+static void cmd_clear(void) {
+    vga_init();
+}
+
+// ── ver ──────────────────────────────────────────────────────────
+// Shows kernel version, build info, and current user.
+static void cmd_ver(void) {
+    vga_puts("\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.0.1\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86 (i686) protected mode\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
+    vga_set_color(CLR_LGRAY,  CLR_BLACK);
+}
+
+// ── cpuid ────────────────────────────────────────────────────────
+// Reads CPU vendor string and brand name via the CPUID instruction.
+static void cmd_cpuid(void) {
+    // Vendor string: CPUID leaf 0
+    uint32_t eax, ebx, ecx, edx;
+    char vendor[13];
+    __asm__ volatile (
+        "cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(0)
+    );
+    // Vendor is packed as EBX+EDX+ECX (in that order)
+    for (int i = 0; i < 4; i++) vendor[i]     = (char)((ebx >> (i * 8)) & 0xFF);
+    for (int i = 0; i < 4; i++) vendor[i + 4] = (char)((edx >> (i * 8)) & 0xFF);
+    for (int i = 0; i < 4; i++) vendor[i + 8] = (char)((ecx >> (i * 8)) & 0xFF);
+    vendor[12] = '\0';
+
+    // Brand string: CPUID leaves 0x80000002–0x80000004 (3 × 16 bytes = 48 chars)
+    char brand[49];
+    uint32_t *b = (uint32_t *)brand;
+    for (int leaf = 0; leaf < 3; leaf++) {
+        uint32_t r[4];
+        __asm__ volatile (
+            "cpuid"
+            : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
+            : "a"(0x80000002 + (uint32_t)leaf)
+        );
+        for (int j = 0; j < 4; j++) b[leaf * 4 + j] = r[j];
+    }
+    brand[48] = '\0';
+
+    // Trim leading spaces from brand string (Intel pads with spaces)
+    const char *brand_trim = brand;
+    while (*brand_trim == ' ') brand_trim++;
+
+    vga_puts("\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Vendor  : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts(vendor);     vga_puts("\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Brand   : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts(brand_trim); vga_puts("\n");
+    vga_set_color(CLR_LGRAY,  CLR_BLACK);
+}
+
+// ── time ─────────────────────────────────────────────────────────
+// Reads the real-time clock from CMOS registers and prints HH:MM:SS.
+// The RTC may store values in BCD — we handle both modes.
+static uint8_t cmos_read(uint8_t reg) {
+    outb(0x70, reg);
+    return inb(0x71);
+}
+
+static uint8_t bcd_to_bin(uint8_t bcd) {
+    return (uint8_t)(((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F));
+}
+
+// Print a two-digit zero-padded number
+static void print_d2(uint8_t v) {
+    vga_putchar((char)('0' + v / 10));
+    vga_putchar((char)('0' + v % 10));
+}
+
+static void cmd_time(void) {
+    // Wait until the RTC is not in the middle of an update
+    while (cmos_read(0x0A) & 0x80);
+
+    uint8_t sec  = cmos_read(0x00);
+    uint8_t min  = cmos_read(0x02);
+    uint8_t hour = cmos_read(0x04);
+    uint8_t day  = cmos_read(0x07);
+    uint8_t mon  = cmos_read(0x08);
+    uint8_t year = cmos_read(0x09);
+
+    // Register B bit 2: 0 = BCD, 1 = binary
+    uint8_t regB = cmos_read(0x0B);
+    if (!(regB & 0x04)) {
+        sec  = bcd_to_bin(sec);
+        min  = bcd_to_bin(min);
+        hour = bcd_to_bin(hour);
+        day  = bcd_to_bin(day);
+        mon  = bcd_to_bin(mon);
+        year = bcd_to_bin(year);
+    }
+
+    // RTC year is 2-digit; assume 2000s
+    uint16_t full_year = (uint16_t)(2000 + year);
+
+    vga_puts("\n  ");
+    vga_set_color(CLR_WHITE, CLR_BLACK);
+    print_d2(hour); vga_putchar(':');
+    print_d2(min);  vga_putchar(':');
+    print_d2(sec);
+    vga_puts("  ");
+    print_d2(day);  vga_putchar('/');
+    print_d2(mon);  vga_putchar('/');
+    // Print 4-digit year
+    vga_putchar((char)('0' + full_year / 1000));
+    vga_putchar((char)('0' + (full_year % 1000) / 100));
+    vga_putchar((char)('0' + (full_year % 100) / 10));
+    vga_putchar((char)('0' + full_year % 10));
+    vga_puts("  (from RTC)\n");
+    vga_set_color(CLR_LGRAY, CLR_BLACK);
+}
+
 // ┌─────────────────────────────────────────────────────────┐
 // │              COMMAND TABLE — edit below                  │
 // └─────────────────────────────────────────────────────────┘
@@ -319,6 +448,11 @@ static Command commands[] = {
     { "mkpan", "Manually trigger a Kernel panic.",  cmd_mkpan },
     { "kpc", "List of kernel panic codes for debugging.",   cmd_kpc},
     { "reboot", "Reboot the system", cmd_reboot },
+    { "echo", "echo the given raw string", cmd_echo },
+    { "clear",  "Clear the screen",                          cmd_clear  },  
+    { "ver",    "Show kernel and system version info",       cmd_ver    },
+    { "cpuid",  "Show CPU vendor and brand string",          cmd_cpuid  },
+    { "time",   "Show current date and time from RTC",       cmd_time   },
     // { "mycommand", "Description here", cmd_mycommand },
 };
 // ┌─────────────────────────────────────────────────────────┐
@@ -404,13 +538,48 @@ static void shell_print_prompt(void) {
     vga_set_color(CLR_WHITE, CLR_BLACK);
 }
 
-static void shell_execute(const char *line) {
+/*static void shell_execute(const char *line) {
     // Trim leading spaces
     while (*line == ' ') line++;
     if (*line == '\0') return;
 
     for (size_t i = 0; i < CMD_COUNT; i++) {
         if (kstrcmp(line, commands[i].name) == 0) {
+            commands[i].fn();
+            return;
+        }
+    }
+
+    vga_puts("\n  ");
+    vga_set_color(CLR_LRED, CLR_BLACK);
+    vga_puts("Unknown command: ");
+    vga_set_color(CLR_LGRAY, CLR_BLACK);
+    vga_puts(line);
+    vga_puts("  (try 'help')\n");
+    vga_set_color(CLR_LGRAY, CLR_BLACK);
+}**/
+
+static void shell_execute(const char *line) {
+    while (*line == ' ') line++;
+    if (*line == '\0') return;
+
+    for (size_t i = 0; i < CMD_COUNT; i++) {
+        size_t nlen = kstrlen(commands[i].name);
+        if (kstrcmp(line, commands[i].name) == 0) {
+            // Exact match — no arguments
+            cmd_args = "";
+            commands[i].fn();
+            return;
+        }
+        // Match "name " prefix — everything after is the args
+        bool prefix_match = true;
+        for (size_t j = 0; j < nlen; j++) {
+            if (line[j] != commands[i].name[j]) { prefix_match = false; break; }
+        }
+        if (prefix_match && line[nlen] == ' ') {
+            const char *args = line + nlen + 1;
+            while (*args == ' ') args++;   // trim leading spaces
+            cmd_args = args;
             commands[i].fn();
             return;
         }
