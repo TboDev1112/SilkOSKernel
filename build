@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# build — SilkOS build wrapper
+#
+# Adds --files support that GNU make doesn't have natively:
+#
+#   ./build                              same as: make
+#   ./build --files myapp.elf           same as: make EXTRA_FILES="myapp.elf"
+#   ./build --files a.elf b.bin c.img   same as: make EXTRA_FILES="a.elf b.bin c.img"
+#   ./build iso --files app.elf         same as: make iso EXTRA_FILES="app.elf"
+#   ./build clean                        same as: make clean
+#   ./build run --files app.elf          build with app.elf bundled, then run
+#
+# Any option not starting with '--files' is forwarded directly to make,
+# so standard make flags (-j4, -B, ARCH=..., etc.) all still work:
+#
+#   ./build -j4 --files myapp.elf
+#   ./build EXTRA_FILES="already set this way too"
+#
+# Program requirements for 'exec':
+#   Your ELF64 binary must:
+#     - Be a static ET_EXEC for x86-64
+#     - Have all PT_LOAD virtual addresses in the first 1 GB (identity-mapped)
+#     - Export an entry point with signature:  int entry(void)
+#
+#   Minimal build line for a user program:
+#     x86_64-elf-gcc -ffreestanding -nostdlib -static \
+#         -Ttext 0x400000 -e _start -o myapp.elf myapp.c
+
+set -euo pipefail
+
+FILES=()
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --files)
+            shift
+            # Consume all following arguments that don't start with '--'
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                FILES+=("$1")
+                shift
+            done
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#FILES[@]} -gt 0 ]]; then
+    FILES_STR="${FILES[*]}"
+    echo "  Embedding: $FILES_STR"
+    exec make "${ARGS[@]}" EXTRA_FILES="$FILES_STR"
+else
+    exec make "${ARGS[@]}"
+fi

@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "silk_fs.h"
 
 void vga_set_color(uint8_t fg, uint8_t bg);
 void vga_puts(const char *s);
@@ -108,7 +109,7 @@ static void serial_write(const char *s) {
 
 #define VGA_COLS   80
 #define VGA_ROWS   25
-#define VGA_BUF    ((uint16_t *)0xB8000)
+#define VGA_BUF    ((uint16_t *)(uintptr_t)0xB8000)
 
 
 #define CLR_BLACK    0x0
@@ -340,6 +341,158 @@ static void kmemcpy(void *dst, const void *src, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = s[i];
 }
 
+static void kmemset(void *dst, uint8_t val, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (size_t i = 0; i < n; i++) d[i] = val;
+}
+
+
+
+
+/* ── ELF64 Loader ──────────────────────────────────────────────────────────
+ *
+ * Embedded binaries are bundled into the kernel .rodata at build time.
+ * To execute one they must be ET_EXEC ELF64 x86-64 binaries whose
+ * PT_LOAD virtual addresses fall inside the identity-mapped first 1 GB.
+ *
+ * A minimal SilkOS user program looks like:
+ *
+ *   // hello.c  —  compile with:
+ *   //   x86_64-elf-gcc -ffreestanding -nostdlib -static \
+ *   //       -Ttext 0x400000 -o hello.elf hello.c
+ *   __attribute__((section(".text._start")))
+ *   int _start(void) {
+ *       // do work; return an exit code
+ *       return 0;
+ *   }
+ *
+ * The kernel calls the entry point as  int entry(void)  and prints the
+ * returned value as the exit code.
+ * ─────────────────────────────────────────────────────────────────────── */
+
+/* ELF64 constants */
+#define EI_NIDENT   16
+#define ELFMAG0     0x7Fu
+#define ELFMAG1     'E'
+#define ELFMAG2     'L'
+#define ELFMAG3     'F'
+#define ELFCLASS64  2u
+#define ET_EXEC     2u
+#define EM_X86_64   62u
+#define PT_LOAD     1u
+
+typedef struct {
+    uint8_t  e_ident[EI_NIDENT];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} Elf64_Phdr;
+
+/* Print a size_t value (unsigned, 64-bit safe) */
+static void kputs_sz(size_t v) {
+    char buf[24];
+    int  i = 0;
+    if (v == 0) { vga_putchar('0'); return; }
+    while (v > 0 && i < (int)sizeof(buf) - 1) {
+        buf[i++] = (char)('0' + (int)(v % 10));
+        v /= 10;
+    }
+    for (int j = i - 1; j >= 0; j--) vga_putchar(buf[j]);
+}
+
+/* Return true when the buffer looks like a valid ELF64 x86-64 executable. */
+static bool elf64_check(const uint8_t *data, size_t size) {
+    if (size < sizeof(Elf64_Ehdr)) return false;
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
+    if (eh->e_ident[0] != ELFMAG0 || eh->e_ident[1] != ELFMAG1 ||
+        eh->e_ident[2] != ELFMAG2 || eh->e_ident[3] != ELFMAG3)
+        return false;
+    if (eh->e_ident[4] != ELFCLASS64) { vga_puts("  exec: not a 64-bit ELF\n");        return false; }
+    if (eh->e_type     != ET_EXEC)     { vga_puts("  exec: not an executable ELF\n");   return false; }
+    if (eh->e_machine  != EM_X86_64)   { vga_puts("  exec: not an x86-64 ELF\n");       return false; }
+    return true;
+}
+
+/*
+ * Load every PT_LOAD segment into memory and call the entry point.
+ * Returns the program's exit code, or -1 on load error.
+ *
+ * NOTE: No isolation — the program runs in ring 0 and shares the kernel's
+ * address space. Virtual addresses must fall in the identity-mapped first
+ * 1 GB. The program may call back into kernel functions via direct call
+ * if it knows their addresses (link-time coupling).
+ */
+static int elf64_exec(const uint8_t *data, size_t size) {
+    if (!elf64_check(data, size)) return -1;
+
+    const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
+
+    /* Validate program-header table bounds */
+    uint64_t ph_end = eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr);
+    if (ph_end > (uint64_t)size) {
+        vga_puts("  exec: program header table out of bounds\n");
+        return -1;
+    }
+
+    /* Map every PT_LOAD segment */
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph =
+            (const Elf64_Phdr *)(data + eh->e_phoff + (uint64_t)i * sizeof(Elf64_Phdr));
+
+        if (ph->p_type != PT_LOAD) continue;
+
+        if (ph->p_offset + ph->p_filesz > (uint64_t)size) {
+            vga_puts("  exec: segment data exceeds file size\n");
+            return -1;
+        }
+        /* Basic overflow guard */
+        if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr) {
+            vga_puts("  exec: segment address overflow\n");
+            return -1;
+        }
+
+        uint8_t       *dst = (uint8_t *)(uintptr_t)ph->p_vaddr;
+        const uint8_t *src = data + ph->p_offset;
+
+        kmemcpy(dst, src, (size_t)ph->p_filesz);
+
+        /* Zero-fill the BSS portion (.memsz > .filesz) */
+        if (ph->p_memsz > ph->p_filesz)
+            kmemset(dst + ph->p_filesz, 0,
+                    (size_t)(ph->p_memsz - ph->p_filesz));
+    }
+
+    /* Call the entry point: int entry(void) */
+    typedef int (*entry_t)(void);
+    entry_t entry = (entry_t)(uintptr_t)eh->e_entry;
+    return entry();
+}
+
+/* cmd_files and cmd_exec are defined further down, after kputs_i32 and
+ * cmd_args are visible.  Forward declarations appear in the command
+ * forward-declaration block. */
+
 
 
 
@@ -382,8 +535,12 @@ static bool kb_ctrl  = false;
 
 
 static uint8_t kb_read_raw(void) {
-    while (!(inb(0x64) & 0x01));   
-    return inb(0x60);
+    for (;;) {
+        uint8_t st = inb(0x64);
+        if (!(st & 0x01)) continue;
+        uint8_t data = inb(0x60);
+        if (!(st & 0x20)) return data;  /* skip mouse data */
+    }
 }
 
 
@@ -463,6 +620,8 @@ static void cmd_calculate(void);
 static void cmd_call(void);
 static void cmd_sxgui(void);
 static void cmd_beep(void);
+static void cmd_files(void);
+static void cmd_exec(void);
 static void reboot(void);
 static void echo(void);
 
@@ -814,60 +973,166 @@ static void sxterm_run(void) {
     vga_redir_end();
 }
 
+/* ── PS/2 Mouse ──────────────────────────────────────────────────────── */
+
+static void ps2_wait_write(void) { while (inb(0x64) & 0x02); }
+static void ps2_wait_read_any(void) { while (!(inb(0x64) & 0x01)); }
+
+static void mouse_cmd(uint8_t cmd) {
+    ps2_wait_write(); outb(0x64, 0xD4);
+    ps2_wait_write(); outb(0x60, cmd);
+    ps2_wait_read_any(); inb(0x60);  /* discard ACK */
+}
+
+static void mouse_init(void) {
+    ps2_wait_write(); outb(0x64, 0xA8);        /* enable aux device */
+    ps2_wait_write(); outb(0x64, 0x20);         /* read command byte */
+    ps2_wait_read_any();
+    uint8_t cb = inb(0x60) | 0x02;             /* set IRQ12 enable */
+    ps2_wait_write(); outb(0x64, 0x60);         /* write command byte */
+    ps2_wait_write(); outb(0x60, cb);
+    mouse_cmd(0xF6);                            /* set defaults */
+    mouse_cmd(0xF4);                            /* enable data reporting */
+}
+
+#define MSCALE 4
+static int     mouse_fx = 0;
+static int     mouse_fy = 0;
+static uint8_t mouse_buf[3];
+static int     mouse_buf_pos = 0;
+
+/* Returns true with dx/dy when a full 3-byte packet is decoded */
+static bool mouse_poll(int *out_dx, int *out_dy) {
+    uint8_t st = inb(0x64);
+    if ((st & 0x21) != 0x21) return false;  /* need bit0 (data) + bit5 (aux) */
+    uint8_t b = inb(0x60);
+    if (mouse_buf_pos == 0 && !(b & 0x08)) return false;  /* sync on bit3 */
+    mouse_buf[mouse_buf_pos++] = b;
+    if (mouse_buf_pos < 3) return false;
+    mouse_buf_pos = 0;
+    if (mouse_buf[0] & 0xC0) return false;  /* overflow */
+    *out_dx =  (int)mouse_buf[1] - ((mouse_buf[0] & 0x10) ? 256 : 0);
+    *out_dy = -((int)mouse_buf[2] - ((mouse_buf[0] & 0x20) ? 256 : 0));
+    return true;
+}
+
+/* Non-blocking keyboard poll; shares shift/caps/ctrl state with kb_getkey */
+static uint8_t kb_ext_pending = 0;
+
+static int kb_poll(void) {
+    uint8_t st = inb(0x64);
+    if (!(st & 0x01) || (st & 0x20)) return 0;  /* no data or it's mouse data */
+    uint8_t sc = inb(0x60);
+    if (sc == 0xE0) { kb_ext_pending = 1; return 0; }
+    if (kb_ext_pending) {
+        kb_ext_pending = 0;
+        if (sc & 0x80) return 0;
+        switch (sc) {
+            case 0x48: return KEY_UP;
+            case 0x50: return KEY_DOWN;
+            case 0x4B: return KEY_LEFT;
+            case 0x4D: return KEY_RIGHT;
+            default:   return 0;
+        }
+    }
+    if (sc & 0x80) {
+        uint8_t r = sc & 0x7F;
+        if (r == 0x2A || r == 0x36) kb_shift = false;
+        if (r == 0x1D) kb_ctrl = false;
+        return 0;
+    }
+    if (sc == 0x2A || sc == 0x36) { kb_shift = true;    return 0; }
+    if (sc == 0x3A)                { kb_caps = !kb_caps; return 0; }
+    if (sc == 0x1D)                { kb_ctrl = true;     return 0; }
+    if (sc >= 128) return 0;
+    char c = kb_shift ? sc_shift[sc] : sc_normal[sc];
+    if (kb_ctrl && (c == 'j' || c == 'J')) return KEY_CTRL_J;
+    if (kb_ctrl && (c == 't' || c == 'T')) return KEY_CTRL_T;
+    if (kb_ctrl) return 0;
+    if (kb_caps && c >= 'a' && c <= 'z') c = (char)(c - 32);
+    if (kb_caps && c >= 'A' && c <= 'Z' && !kb_shift) c = (char)(c + 32);
+    return c;
+}
+
+/* Render the pointer: CP437 ► (0x10) with fg/bg swapped relative to cell below */
+static uint16_t make_ptr_cell(uint16_t under) {
+    uint8_t color = (uint8_t)(under >> 8);
+    uint8_t fg = color & 0x0F;
+    uint8_t bg = (color >> 4) & 0x0F;
+    return vga_entry('\x10', (uint8_t)((fg << 4) | bg));
+}
+
 static void cmd_sxgui(void) {
     const uint8_t desk_fg = CLR_BLACK;
     const uint8_t desk_bg = CLR_GREEN;
 
-    for (size_t y = 0; y < VGA_ROWS - 1; y++)
-        for (size_t x = 0; x < VGA_COLS; x++)
-            vga_put_at(x, y, ' ', desk_fg, desk_bg);
-
+    for (size_t ry = 0; ry < VGA_ROWS - 1; ry++)
+        for (size_t rx = 0; rx < VGA_COLS; rx++)
+            vga_put_at(rx, ry, ' ', desk_fg, desk_bg);
     sxgui_draw_status_bar();
 
-    size_t cx = 2, cy = 2;
-    size_t px = cx, py = cy;
-    uint16_t prev_cell = vga_buf[cy * VGA_COLS + cx];
-    uint16_t cursor_cell = vga_entry('_', (uint8_t)((desk_bg << 4) | (CLR_WHITE & 0x0F)));
-    vga_put_cell(cx, cy, cursor_cell);
+    mouse_init();
+    mouse_fx      = (VGA_COLS / 2) * MSCALE;
+    mouse_fy      = ((VGA_ROWS - 1) / 2) * MSCALE;
+    mouse_buf_pos = 0;
+    kb_ext_pending = 0;
+
+    size_t cx = (size_t)(mouse_fx / MSCALE);
+    size_t cy = (size_t)(mouse_fy / MSCALE);
+    uint16_t under = vga_buf[cy * VGA_COLS + cx];
+    vga_put_cell(cx, cy, make_ptr_cell(under));
 
     for (;;) {
         vga_row = cy;
         vga_col = cx;
         vga_update_cursor();
 
-        int key = kb_getkey();
-        if (!key) continue;
+        bool moved = false;
 
-        vga_put_cell(px, py, prev_cell);
-
-        if (key == KEY_CTRL_J) break;
-        if (key == KEY_CTRL_T) {
-            sxterm_run();
-        } else if (key == KEY_UP) {
-            if (cy > 0) cy--;
-        } else if (key == KEY_DOWN) {
-            if (cy + 2 < VGA_ROWS) cy++;
-        } else if (key == KEY_LEFT) {
-            if (cx > 0) cx--;
-        } else if (key == KEY_RIGHT) {
-            if (cx + 1 < VGA_COLS) cx++;
-        } else if (key == '\b') {
-            if (cx > 0) {
-                cx--;
-                vga_put_at(cx, cy, ' ', desk_fg, desk_bg);
-            }
-        } else if (key == '\n' || key == '\r') {
-            cx = 0;
-            if (cy + 2 < VGA_ROWS) cy++;
-        } else if (key >= 0x20 && key < 0x7F) {
-            vga_put_at(cx, cy, (char)key, desk_fg, desk_bg);
-            if (cx + 1 < VGA_COLS) cx++;
+        int mdx = 0, mdy = 0;
+        if (mouse_poll(&mdx, &mdy)) {
+            mouse_fx += mdx;
+            mouse_fy += mdy;
+            if (mouse_fx < 0)                                mouse_fx = 0;
+            if (mouse_fx >= (int)(VGA_COLS * MSCALE))        mouse_fx = (int)(VGA_COLS * MSCALE) - 1;
+            if (mouse_fy < 0)                                mouse_fy = 0;
+            if (mouse_fy >= (int)((VGA_ROWS - 1) * MSCALE)) mouse_fy = (int)((VGA_ROWS - 1) * MSCALE) - 1;
+            moved = true;
         }
 
-        px = cx;
-        py = cy;
-        prev_cell = vga_buf[cy * VGA_COLS + cx];
-        vga_put_cell(cx, cy, cursor_cell);
+        int key = kb_poll();
+
+        if (key == KEY_CTRL_J) {
+            vga_put_cell(cx, cy, under);
+            break;
+        }
+
+        if (key == KEY_CTRL_T) {
+            vga_put_cell(cx, cy, under);
+            sxterm_run();
+            mouse_buf_pos = 0;
+            for (size_t ry = 0; ry < VGA_ROWS - 1; ry++)
+                for (size_t rx = 0; rx < VGA_COLS; rx++)
+                    vga_put_at(rx, ry, ' ', desk_fg, desk_bg);
+            sxgui_draw_status_bar();
+            under = vga_buf[cy * VGA_COLS + cx];
+            vga_put_cell(cx, cy, make_ptr_cell(under));
+        } else if (key == KEY_UP    && mouse_fy >= MSCALE)                         { mouse_fy -= MSCALE; moved = true; }
+          else if (key == KEY_DOWN  && mouse_fy < (int)((VGA_ROWS - 2) * MSCALE)) { mouse_fy += MSCALE; moved = true; }
+          else if (key == KEY_LEFT  && mouse_fx >= MSCALE)                         { mouse_fx -= MSCALE; moved = true; }
+          else if (key == KEY_RIGHT && mouse_fx < (int)((VGA_COLS - 1) * MSCALE)) { mouse_fx += MSCALE; moved = true; }
+
+        if (moved) {
+            size_t ncx = (size_t)(mouse_fx / MSCALE);
+            size_t ncy = (size_t)(mouse_fy / MSCALE);
+            if (ncx != cx || ncy != cy) {
+                vga_put_cell(cx, cy, under);
+                cx = ncx;
+                cy = ncy;
+                under = vga_buf[cy * VGA_COLS + cx];
+                vga_put_cell(cx, cy, make_ptr_cell(under));
+            }
+        }
 
         sxgui_draw_status_bar();
     }
@@ -888,7 +1153,7 @@ static void cmd_ver(void) {
     vga_puts("\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.1.0\n");
-    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86 (i686) protected mode\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86-64 long mode\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
     vga_set_color(CLR_LGRAY,  CLR_BLACK);
 }
@@ -897,7 +1162,7 @@ static void cmd_neofetch(void) {
     vga_puts("\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.1.0\n");
-    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86 (i686) protected mode\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86-64 long mode\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
     vga_set_color(CLR_LGRAY,  CLR_BLACK);
 }
@@ -999,6 +1264,66 @@ static void cmd_time(void) {
     vga_set_color(CLR_LGRAY, CLR_BLACK);
 }
 
+/* ── ELF shell commands (here so cmd_args and kputs_i32 are in scope) ──── */
+
+static void cmd_files(void) {
+    vga_puts("\n");
+    vga_set_color(CLR_LCYAN, CLR_BLACK);
+    vga_puts("  Embedded files:\n");
+    vga_set_color(CLR_LGRAY, CLR_BLACK);
+    vga_puts("  ──────────────────────────────────────\n");
+
+    if (silk_file_count == 0) {
+        vga_puts("  (none)\n");
+        vga_puts("  Bundle files with: make EXTRA_FILES=\"a.elf b.bin\"\n");
+        vga_puts("                 or: ./build --files a.elf b.bin\n");
+        vga_puts("  ──────────────────────────────────────\n");
+        return;
+    }
+
+    for (size_t i = 0; i < silk_file_count; i++) {
+        vga_puts("  ");
+        vga_set_color(CLR_LGREEN, CLR_BLACK);
+        vga_puts(silk_files[i].name);
+        vga_set_color(CLR_LGRAY, CLR_BLACK);
+
+        size_t nl = kstrlen(silk_files[i].name);
+        for (size_t p = nl; p < 22; p++) vga_putchar(' ');
+
+        kputs_sz(silk_file_size(&silk_files[i]));
+        vga_puts(" bytes\n");
+    }
+    vga_puts("  ──────────────────────────────────────\n");
+}
+
+static void cmd_exec(void) {
+    const char *name = cmd_args;
+    while (*name == ' ') name++;
+
+    if (*name == '\0') {
+        vga_puts("\n  Usage: exec <filename>\n");
+        vga_puts("  Use 'files' to list available binaries.\n");
+        return;
+    }
+
+    for (size_t i = 0; i < silk_file_count; i++) {
+        if (kstrcmp(silk_files[i].name, name) == 0) {
+            vga_puts("\n");
+            int rc = elf64_exec(silk_files[i].data, silk_file_size(&silk_files[i]));
+            if (rc >= 0) {
+                vga_puts("\n  [process exited: ");
+                kputs_i32(rc);
+                vga_puts("]\n");
+            }
+            return;
+        }
+    }
+
+    vga_puts("\n  exec: '");
+    vga_puts(name);
+    vga_puts("' not found  (run 'files' for a list)\n");
+}
+
 static Command commands[] = {
     { "help", "Show this help message",     cmd_help },
     { "halt", "Shut down the kernel / shell",   cmd_halt },
@@ -1016,6 +1341,8 @@ static Command commands[] = {
     { "time",   "Show current date and time from RTC",       cmd_time   },
     { "neofetch", "custom neofetch for SilkOS",    cmd_neofetch},
     { "beep",    "Play a tone: beep <vol 1-100> <freq Hz> <ms>", cmd_beep },
+    { "files",   "List files bundled into this kernel image",    cmd_files },
+    { "exec",    "Run an embedded ELF64 binary: exec <name>",    cmd_exec  },
 };
 
 #define CMD_COUNT ((size_t)(sizeof(commands) / sizeof(commands[0])))
