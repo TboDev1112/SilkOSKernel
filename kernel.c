@@ -1,29 +1,29 @@
-// ============================================================
-//  kernel.c — SilkOS Kernel v0.0.1
-//
-//  Sections:
-//    1.  I/O Port Access
-//    2.  VGA Text Mode Driver
-//    3.  String Utilities
-//    4.  Keyboard Driver
-//    5.  Shell Command Table  ← ADD YOUR COMMANDS HERE
-//    6.  Built-in Command Implementations
-//    7.  Shell Engine
-//    8.  Kernel Entry Point
-// ============================================================
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdio.h>
 
-// Forward declarations
 void vga_set_color(uint8_t fg, uint8_t bg);
 void vga_puts(const char *s);
 void kernel_panic(const char *msg);
 
-// ============================================================
-// 1. I/O Port Access
-// ============================================================
+static inline void cpu_relax(void) {
+    __asm__ volatile ("pause");
+}
+
+void usleep_mil(uint32_t ms) {
+    // Tunable constant: loops per millisecond.
+    // Start with this value in QEMU; adjust if needed.
+    // If it sleeps too fast, increase it. Too slow, decrease it.
+    const uint32_t LOOPS_PER_MS = 50000;
+
+    for (uint32_t t = 0; t < ms; t++) {
+        for (volatile uint32_t i = 0; i < LOOPS_PER_MS; i++) {
+            cpu_relax();
+        }
+    }
+}
+
 
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
@@ -35,15 +35,82 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-// ============================================================
-// 2. VGA Text Mode Driver
-// ============================================================
+// PC Speaker via PIT channel 2
+// The PIT runs at 1,193,182 Hz; dividing by the desired frequency gives the
+// counter reload value for a 50% duty-cycle square wave (mode 3).
+#define PIT_HZ 1193182UL
+
+static void pc_speaker_set_freq(uint32_t freq) {
+    uint32_t div = (uint32_t)(PIT_HZ / freq);
+    outb(0x43, 0xB6);                              // ch2, lobyte/hibyte, mode 3
+    outb(0x42, (uint8_t)(div & 0xFF));
+    outb(0x42, (uint8_t)((div >> 8) & 0xFF));
+}
+
+static void pc_speaker_on(void) {
+    outb(0x61, inb(0x61) | 0x03);                 // gate PIT ch2 + enable speaker
+}
+
+static void pc_speaker_off(void) {
+    outb(0x61, inb(0x61) & (uint8_t)~0x03);
+}
+
+// PWM volume: within each ~1 ms cycle, hold speaker on for vol% of the
+// LOOPS_PER_MS busy-wait loops to approximate a softer tone.
+static void beep_play(uint32_t vol, uint32_t freq, uint32_t ms) {
+    if (!vol || !freq || !ms) return;
+    if (vol > 100) vol = 100;
+
+    pc_speaker_set_freq(freq);
+
+    if (vol == 100) {
+        pc_speaker_on();
+        usleep_mil(ms);
+        pc_speaker_off();
+        return;
+    }
+
+    const uint32_t CYCLE = 50000;              // matches LOOPS_PER_MS in usleep_mil
+    uint32_t on_loops  = (CYCLE * vol) / 100;
+    uint32_t off_loops = CYCLE - on_loops;
+
+    for (uint32_t t = 0; t < ms; t++) {
+        pc_speaker_on();
+        for (volatile uint32_t i = 0; i < on_loops; i++) cpu_relax();
+        pc_speaker_off();
+        for (volatile uint32_t i = 0; i < off_loops; i++) cpu_relax();
+    }
+    pc_speaker_off();
+}
+
+static void serial_init(void) {
+    outb(0x3F8 + 1, 0x00);
+    outb(0x3F8 + 3, 0x80);
+    outb(0x3F8 + 0, 0x03);
+    outb(0x3F8 + 1, 0x00);
+    outb(0x3F8 + 3, 0x03);
+    outb(0x3F8 + 2, 0xC7);
+    outb(0x3F8 + 4, 0x0B);
+}
+
+static void serial_write_char(char c) {
+    while ((inb(0x3F8 + 5) & 0x20) == 0) {}
+    outb(0x3F8 + 0, (uint8_t)c);
+}
+
+static void serial_write(const char *s) {
+    for (; *s; s++) serial_write_char(*s);
+}
+
+
+
+
 
 #define VGA_COLS   80
 #define VGA_ROWS   25
 #define VGA_BUF    ((uint16_t *)0xB8000)
 
-// VGA color codes (foreground | background << 4)
+
 #define CLR_BLACK    0x0
 #define CLR_BLUE     0x1
 #define CLR_GREEN    0x2
@@ -87,7 +154,7 @@ static void vga_scroll(void) {
 }
 
 void vga_init(void) {
-    vga_color = (CLR_BLACK << 4) | CLR_LGRAY;  // grey on black
+    vga_color = (CLR_BLACK << 4) | CLR_LGRAY;  
     vga_buf   = VGA_BUF;
     vga_row   = 0;
     vga_col   = 0;
@@ -96,23 +163,21 @@ void vga_init(void) {
     vga_update_cursor();
 }
 
-// ============================================================
-// Kernel Panic
-// ============================================================
+
+
+
 
 void kernel_panic(const char *msg) {
-    // Disable interrupts immediately — no going back
+    
     __asm__ volatile ("cli");
 
-    // Red on black — hard to miss
+    
     vga_set_color(CLR_LRED, CLR_BLACK);
     vga_puts("\n\n");
-    vga_puts("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-    vga_puts("  !!          *** KERNEL PANIC ***        !!\n");
-    vga_puts("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n");
+    vga_puts("Kernel Panic!\n");
 
     vga_set_color(CLR_WHITE, CLR_BLACK);
-    vga_puts("  Reason : ");
+    vga_puts("Reason : ");
     vga_set_color(CLR_YELLOW, CLR_BLACK);
     vga_puts(msg);
 
@@ -120,9 +185,7 @@ void kernel_panic(const char *msg) {
     vga_puts("\n\n  The system has been halted.\n");
     vga_puts("  Restart your machine to continue.\n\n");
     vga_set_color(CLR_LRED, CLR_BLACK);
-    vga_puts("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-
-    // Halt forever — no recovery
+    
     for (;;) __asm__ volatile ("hlt");
 }
 
@@ -130,7 +193,108 @@ void vga_set_color(uint8_t fg, uint8_t bg) {
     vga_color = (uint8_t)((bg << 4) | (fg & 0x0F));
 }
 
+static void vga_recolor_screen(uint8_t fg, uint8_t bg) {
+    uint8_t color = (uint8_t)((bg << 4) | (fg & 0x0F));
+    for (size_t i = 0; i < VGA_COLS * VGA_ROWS; i++) {
+        uint16_t cell = vga_buf[i];
+        uint8_t ch = (uint8_t)(cell & 0xFF);
+        vga_buf[i] = vga_entry((char)ch, color);
+    }
+    vga_color = color;
+}
+
+typedef struct {
+    bool active;
+    size_t x0, y0, w, h;
+    size_t cx, cy;
+    uint8_t fg, bg;
+} VgaRedirect;
+
+static VgaRedirect vga_redir = {0};
+static size_t vga_saved_row, vga_saved_col;
+
+static void vga_redir_begin(size_t x0, size_t y0, size_t w, size_t h, uint8_t fg, uint8_t bg) {
+    vga_saved_row = vga_row;
+    vga_saved_col = vga_col;
+    vga_redir.active = true;
+    vga_redir.x0 = x0;
+    vga_redir.y0 = y0;
+    vga_redir.w = w;
+    vga_redir.h = h;
+    vga_redir.cx = 0;
+    vga_redir.cy = 0;
+    vga_redir.fg = fg;
+    vga_redir.bg = bg;
+}
+
+static void vga_redir_end(void) {
+    vga_redir.active = false;
+    vga_row = vga_saved_row;
+    vga_col = vga_saved_col;
+    vga_update_cursor();
+}
+
+static void vga_redir_clear(void) {
+    if (!vga_redir.active) return;
+    uint8_t color = (uint8_t)((vga_redir.bg << 4) | (vga_redir.fg & 0x0F));
+    for (size_t y = 0; y < vga_redir.h; y++) {
+        for (size_t x = 0; x < vga_redir.w; x++) {
+            vga_buf[(vga_redir.y0 + y) * VGA_COLS + (vga_redir.x0 + x)] = vga_entry(' ', color);
+        }
+    }
+    vga_redir.cx = 0;
+    vga_redir.cy = 0;
+}
+
+static void vga_redir_scroll(void) {
+    if (!vga_redir.active) return;
+    uint8_t color = (uint8_t)((vga_redir.bg << 4) | (vga_redir.fg & 0x0F));
+    for (size_t y = 0; y + 1 < vga_redir.h; y++) {
+        for (size_t x = 0; x < vga_redir.w; x++) {
+            vga_buf[(vga_redir.y0 + y) * VGA_COLS + (vga_redir.x0 + x)] =
+                vga_buf[(vga_redir.y0 + y + 1) * VGA_COLS + (vga_redir.x0 + x)];
+        }
+    }
+    size_t last = vga_redir.h - 1;
+    for (size_t x = 0; x < vga_redir.w; x++) {
+        vga_buf[(vga_redir.y0 + last) * VGA_COLS + (vga_redir.x0 + x)] = vga_entry(' ', color);
+    }
+    if (vga_redir.cy > 0) vga_redir.cy = vga_redir.h - 1;
+}
+
 void vga_putchar(char c) {
+    if (c == '\n') serial_write_char('\n');
+    else if (c == '\r') serial_write_char('\r');
+    else if (c == '\b') serial_write_char('\b');
+    else serial_write_char(c);
+
+    if (vga_redir.active) {
+        uint8_t color = (uint8_t)((vga_redir.bg << 4) | (vga_redir.fg & 0x0F));
+        if (c == '\n') {
+            vga_redir.cx = 0;
+            if (++vga_redir.cy == vga_redir.h) vga_redir_scroll();
+        } else if (c == '\r') {
+            vga_redir.cx = 0;
+        } else if (c == '\b') {
+            if (vga_redir.cx > 0) {
+                vga_redir.cx--;
+                vga_buf[(vga_redir.y0 + vga_redir.cy) * VGA_COLS + (vga_redir.x0 + vga_redir.cx)] =
+                    vga_entry(' ', color);
+            }
+        } else {
+            vga_buf[(vga_redir.y0 + vga_redir.cy) * VGA_COLS + (vga_redir.x0 + vga_redir.cx)] =
+                vga_entry(c, color);
+            if (++vga_redir.cx == vga_redir.w) {
+                vga_redir.cx = 0;
+                if (++vga_redir.cy == vga_redir.h) vga_redir_scroll();
+            }
+        }
+        vga_row = vga_redir.y0 + vga_redir.cy;
+        vga_col = vga_redir.x0 + vga_redir.cx;
+        vga_update_cursor();
+        return;
+    }
+
     if (c == '\n') {
         vga_col = 0;
         if (++vga_row == VGA_ROWS) vga_scroll();
@@ -155,9 +319,9 @@ void vga_puts(const char *s) {
     for (; *s; s++) vga_putchar(*s);
 }
 
-// ============================================================
-// 3. String Utilities
-// ============================================================
+
+
+
 
 static size_t kstrlen(const char *s) {
     size_t n = 0;
@@ -176,11 +340,11 @@ static void kmemcpy(void *dst, const void *src, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = s[i];
 }
 
-// ============================================================
-// 4. Keyboard Driver  (polling, no interrupts required)
-// ============================================================
 
-// US QWERTY scan code set 1 — unshifted
+
+
+
+
 static const char sc_normal[128] = {
      0,  27, '1','2','3','4','5','6','7','8','9','0','-','=','\b',
     '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
@@ -192,7 +356,7 @@ static const char sc_normal[128] = {
      0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 };
 
-// US QWERTY scan code set 1 — shifted
+
 static const char sc_shift[128] = {
      0,  27, '!','@','#','$','%','^','&','*','(',')','_','+','\b',
     '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',
@@ -204,29 +368,32 @@ static const char sc_shift[128] = {
      0,   0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 };
 
-// Special key return values (above ASCII range)
+
 #define KEY_UP    0x100
 #define KEY_DOWN  0x101
 #define KEY_LEFT  0x102
 #define KEY_RIGHT 0x103
+#define KEY_CTRL_J 0x104
+#define KEY_CTRL_T 0x105
 
 static bool kb_shift = false;
 static bool kb_caps  = false;
+static bool kb_ctrl  = false;
 
-// Block until the keyboard output buffer is ready, then read a byte
+
 static uint8_t kb_read_raw(void) {
-    while (!(inb(0x64) & 0x01));   // wait for OBF (output buffer full)
+    while (!(inb(0x64) & 0x01));   
     return inb(0x60);
 }
 
-// Returns an int: printable ASCII char, KEY_* constant, or 0 (ignore)
+
 int kb_getkey(void) {
     uint8_t sc = kb_read_raw();
 
-    // Extended key prefix (arrows, etc.)
+    
     if (sc == 0xE0) {
         uint8_t ext = kb_read_raw();
-        if (ext & 0x80) return 0;  // release — ignore
+        if (ext & 0x80) return 0;  
         switch (ext) {
             case 0x48: return KEY_UP;
             case 0x50: return KEY_DOWN;
@@ -236,58 +403,73 @@ int kb_getkey(void) {
         }
     }
 
-    // Key release (high bit set)
+    
     if (sc & 0x80) {
         uint8_t rel = sc & 0x7F;
         if (rel == 0x2A || rel == 0x36) kb_shift = false;
+        if (rel == 0x1D) kb_ctrl = false;
         return 0;
     }
 
-    // Modifier tracking
+    
     if (sc == 0x2A || sc == 0x36) { kb_shift = true;           return 0; }
     if (sc == 0x3A)                { kb_caps  = !kb_caps;       return 0; }
-    if (sc == 0x1D)                { /* Ctrl — ignored for now */ return 0; }
+    if (sc == 0x1D)                { kb_ctrl = true;            return 0; }
 
     if (sc >= 128) return 0;
 
     char c = kb_shift ? sc_shift[sc] : sc_normal[sc];
 
-    // Apply Caps Lock to letters only
+    if (kb_ctrl && (c == 'j' || c == 'J')) return KEY_CTRL_J;
+    if (kb_ctrl && (c == 't' || c == 'T')) return KEY_CTRL_T;
+    if (kb_ctrl) return 0;
+
+    
     if (kb_caps && c >= 'a' && c <= 'z') c = (char)(c - 32);
     if (kb_caps && c >= 'A' && c <= 'Z' && !kb_shift) c = (char)(c + 32);
 
     return c;
 }
 
-// ============================================================
-// 5. Shell Command Table
-//
-//  HOW TO ADD A COMMAND:
-//  ──────────────────────
-//  a) Write your handler function (must match signature below):
-//       static void cmd_mycommand(void) { ... }
-//
-//  b) Add an entry to the `commands[]` array below:
-//       { "mycommand", "What it does", cmd_mycommand },
-//
-//  That's it — it will automatically appear in `help`.
-// ============================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 typedef void (*cmd_fn)(void);
 
 typedef struct {
-    const char *name;   // what the user types
-    const char *desc;   // shown by `help`
-    cmd_fn      fn;     // handler function
+    const char *name;   
+    const char *desc;   
+    cmd_fn      fn;     
 } Command;
 
-// Forward-declare built-ins
+
 static void cmd_help(void);
 static void cmd_halt(void);
 static void cmd_mkpan(void);
 static void cmd_kpc(void);
+static void cmd_color(void);
+static void cmd_calculate(void);
+static void cmd_call(void);
+static void cmd_sxgui(void);
+static void cmd_beep(void);
 static void reboot(void);
 static void echo(void);
+
+static uint8_t cmos_read(uint8_t reg);
+static uint8_t bcd_to_bin(uint8_t bcd);
+
+static void shell_execute(const char *line);
 
 static void cmd_mkpan(void) {
     kernel_panic("The SilkOS Kernel has had a fatal error and cannot recover: 0x001");
@@ -301,14 +483,14 @@ static void cmd_reboot(void) {
     vga_set_color(CLR_YELLOW, CLR_BLACK);
     vga_puts("\n  Rebooting SilkOS...\n");
 
-    // Flush the keyboard controller — required before triggering reset
+    
     uint8_t status;
     do { status = inb(0x64); } while (status & 0x02);
 
-    // Pulse the CPU reset line via the keyboard controller
+    
     outb(0x64, 0xFE);
 
-    // If the above didn't work, triple-fault as a fallback
+    
     kernel_panic("The SilkOS Kernel has had a fatal error and cannot recover: 0x002");
 }
 static const char *cmd_args = "";
@@ -321,27 +503,409 @@ static void cmd_echo(void) {
     vga_set_color(CLR_LGRAY, CLR_BLACK);
 }
 
-// ── clear ────────────────────────────────────────────────────────
-// Wipes the screen by re-initialising the VGA driver.
+static bool streq(const char *a, const char *b) {
+    return kstrcmp(a, b) == 0;
+}
+
+static void cmd_color(void) {
+    const char *a = cmd_args;
+    while (*a == ' ') a++;
+
+    if (*a == '\0') {
+        vga_puts("\n  Usage: color 0x0|0x1|0x2|0x3|0x4 | color reset\n");
+        return;
+    }
+
+    if (streq(a, "reset")) {
+        vga_recolor_screen(CLR_WHITE, CLR_BLACK);
+        vga_puts("\n  Color reset.\n");
+        return;
+    }
+
+    if (a[0] == '0' && (a[1] == 'x' || a[1] == 'X')) a += 2;
+
+    char d = a[0];
+    uint8_t fg;
+    switch (d) {
+        case '0': fg = CLR_RED;    break;
+        case '1': fg = CLR_BLUE;   break;
+        case '2': fg = CLR_YELLOW; break;
+        case '3': fg = CLR_BROWN;  break;
+        case '4': fg = CLR_BLACK;  break;
+        default:
+            vga_puts("\n  Unknown color. Use 0x0..0x4 or reset.\n");
+            return;
+    }
+
+    vga_recolor_screen(fg, CLR_BLACK);
+    vga_puts("\n  Color set.\n");
+}
+
+static void kputs_i32(int32_t v) {
+    char buf[16];
+    int i = 0;
+    if (v == 0) { vga_putchar('0'); return; }
+    bool neg = v < 0;
+    uint32_t n = neg ? (uint32_t)(-v) : (uint32_t)v;
+    while (n && i < (int)sizeof(buf)) {
+        buf[i++] = (char)('0' + (n % 10));
+        n /= 10;
+    }
+    if (neg) vga_putchar('-');
+    while (i--) vga_putchar(buf[i]);
+}
+
+static const char *skip_ws(const char *p) {
+    while (*p == ' ' || *p == '\t') p++;
+    return p;
+}
+
+static bool parse_i32(const char **pp, int32_t *out) {
+    const char *p = skip_ws(*pp);
+    bool neg = false;
+    if (*p == '+') p++;
+    else if (*p == '-') { neg = true; p++; }
+    p = skip_ws(p);
+    if (*p < '0' || *p > '9') return false;
+    int32_t v = 0;
+    while (*p >= '0' && *p <= '9') {
+        v = (int32_t)(v * 10 + (*p - '0'));
+        p++;
+    }
+    *pp = p;
+    *out = neg ? -v : v;
+    return true;
+}
+
+static int op_prec(char op) {
+    if (op == '*' || op == '/') return 2;
+    if (op == '+' || op == '-') return 1;
+    return 0;
+}
+
+static bool apply_op(int32_t *vals, int *vtop, char op) {
+    if (*vtop < 1) return false;
+    int32_t b = vals[(*vtop)--];
+    int32_t a = vals[(*vtop)--];
+    int32_t r = 0;
+    switch (op) {
+        case '+': r = a + b; break;
+        case '-': r = a - b; break;
+        case '*': r = a * b; break;
+        case '/': if (b == 0) return false; r = a / b; break;
+        default: return false;
+    }
+    vals[++(*vtop)] = r;
+    return true;
+}
+
+static void cmd_calculate(void) {
+    const char *p = cmd_args;
+    int32_t vals[64];
+    char ops[64];
+    int vtop = -1;
+    int otop = -1;
+
+    for (;;) {
+        p = skip_ws(p);
+        if (*p == '\0') break;
+
+        int32_t num;
+        if (!parse_i32(&p, &num)) {
+            vga_puts("\n  calculate: parse error\n");
+            return;
+        }
+        vals[++vtop] = num;
+
+        p = skip_ws(p);
+        char op = *p;
+        if (op == '\0') break;
+        if (op != '+' && op != '-' && op != '*' && op != '/') {
+            vga_puts("\n  calculate: expected operator\n");
+            return;
+        }
+        p++;
+
+        while (otop >= 0 && op_prec(ops[otop]) >= op_prec(op)) {
+            if (!apply_op(vals, &vtop, ops[otop--])) {
+                vga_puts("\n  calculate: math error\n");
+                return;
+            }
+        }
+        ops[++otop] = op;
+    }
+
+    while (otop >= 0) {
+        if (!apply_op(vals, &vtop, ops[otop--])) {
+            vga_puts("\n  calculate: math error\n");
+            return;
+        }
+    }
+
+    if (vtop != 0) {
+        vga_puts("\n  calculate: parse error\n");
+        return;
+    }
+
+    vga_puts("\n  = ");
+    kputs_i32(vals[0]);
+    vga_puts("\n");
+}
+
+static void cmd_call(void) {
+    const char *p = cmd_args;
+    p = skip_ws(p);
+    if (*p == '\0') {
+        vga_puts("\n  Usage: call <command> [; command2 ...]\n");
+        return;
+    }
+
+    char buf[256];
+    size_t bi = 0;
+    while (*p) {
+        if (*p == ';') {
+            buf[bi] = '\0';
+            const char *cmd = skip_ws(buf);
+            if (*cmd) shell_execute(cmd);
+            bi = 0;
+            p++;
+            continue;
+        }
+        if (bi + 1 < sizeof(buf)) buf[bi++] = *p;
+        p++;
+    }
+    buf[bi] = '\0';
+    const char *cmd = skip_ws(buf);
+    if (*cmd) shell_execute(cmd);
+}
+
+static void cmd_beep(void) {
+    const char *p = cmd_args;
+    int32_t vol, freq, dur;
+
+    if (!parse_i32(&p, &vol) || !parse_i32(&p, &freq) || !parse_i32(&p, &dur)) {
+        vga_puts("\n  Usage: beep <volume 1-100> <frequency Hz> <duration ms>\n");
+        vga_puts("  Example: beep 16 400 200\n");
+        return;
+    }
+    if (vol < 1 || vol > 100) { vga_puts("\n  beep: volume must be 1-100\n");         return; }
+    if (freq < 20 || freq > 20000) { vga_puts("\n  beep: frequency must be 20-20000 Hz\n"); return; }
+    if (dur  < 1 || dur  > 30000) { vga_puts("\n  beep: duration must be 1-30000 ms\n");   return; }
+
+    beep_play((uint32_t)vol, (uint32_t)freq, (uint32_t)dur);
+}
+
+static void vga_put_at(size_t x, size_t y, char c, uint8_t fg, uint8_t bg) {
+    if (x >= VGA_COLS || y >= VGA_ROWS) return;
+    uint8_t color = (uint8_t)((bg << 4) | (fg & 0x0F));
+    vga_buf[y * VGA_COLS + x] = vga_entry(c, color);
+}
+
+static void vga_put_cell(size_t x, size_t y, uint16_t cell) {
+    if (x >= VGA_COLS || y >= VGA_ROWS) return;
+    vga_buf[y * VGA_COLS + x] = cell;
+}
+
+static void vga_write_at(size_t x, size_t y, const char *s, uint8_t fg, uint8_t bg) {
+    size_t cx = x;
+    while (*s && cx < VGA_COLS) {
+        vga_put_at(cx, y, *s, fg, bg);
+        cx++;
+        s++;
+    }
+}
+
+static void print_d2_at(size_t x, size_t y, uint8_t v, uint8_t fg, uint8_t bg) {
+    vga_put_at(x + 0, y, (char)('0' + v / 10), fg, bg);
+    vga_put_at(x + 1, y, (char)('0' + v % 10), fg, bg);
+}
+
+static void sxgui_draw_status_bar(void) {
+    size_t y = VGA_ROWS - 1;
+    for (size_t x = 0; x < VGA_COLS; x++) vga_put_at(x, y, ' ', CLR_BLACK, CLR_LGRAY);
+
+    uint8_t sec  = cmos_read(0x00);
+    uint8_t min  = cmos_read(0x02);
+    uint8_t hour = cmos_read(0x04);
+    uint8_t regB = cmos_read(0x0B);
+    if (!(regB & 0x04)) {
+        sec  = bcd_to_bin(sec);
+        min  = bcd_to_bin(min);
+        hour = bcd_to_bin(hour);
+    }
+
+    vga_write_at(2, y, "Sx", CLR_BLACK, CLR_LGRAY);
+    size_t tx = VGA_COLS - 10;
+    if (tx < 10) tx = 10;
+    print_d2_at(tx + 0, y, hour, CLR_BLACK, CLR_LGRAY);
+    vga_put_at(tx + 2, y, ':', CLR_BLACK, CLR_LGRAY);
+    print_d2_at(tx + 3, y, min, CLR_BLACK, CLR_LGRAY);
+    vga_put_at(tx + 5, y, ':', CLR_BLACK, CLR_LGRAY);
+    print_d2_at(tx + 6, y, sec, CLR_BLACK, CLR_LGRAY);
+}
+
+static void shell_execute(const char *line);
+
+static void sxterm_draw_window(size_t x0, size_t y0, size_t w, size_t h) {
+    if (w < 4 || h < 3) return;
+    for (size_t y = 0; y < h; y++) {
+        for (size_t x = 0; x < w; x++) {
+            char ch = ' ';
+            if (y == 0 && (x == 0 || x + 1 == w)) ch = '+';
+            else if (y + 1 == h && (x == 0 || x + 1 == w)) ch = '+';
+            else if (y == 0 || y + 1 == h) ch = '-';
+            else if (x == 0 || x + 1 == w) ch = '|';
+            vga_put_at(x0 + x, y0 + y, ch, CLR_BLACK, CLR_LGRAY);
+        }
+    }
+    vga_write_at(x0 + 2, y0, "SxTerm  (Ctrl+J closes)", CLR_BLACK, CLR_LGRAY);
+}
+
+static void sxterm_run(void) {
+    const size_t win_w = 70;
+    const size_t win_h = 9;
+    const size_t x0 = (VGA_COLS - win_w) / 2;
+    const size_t y0 = VGA_ROWS - 1 - win_h;
+
+    sxterm_draw_window(x0, y0, win_w, win_h);
+
+    const size_t ix0 = x0 + 1;
+    const size_t iy0 = y0 + 1;
+    const size_t iw = win_w - 2;
+    const size_t ih = win_h - 2;
+
+    vga_redir_begin(ix0, iy0, iw, ih, CLR_LGRAY, CLR_BLACK);
+    vga_redir_clear();
+
+    char input[128];
+    int len = 0;
+
+    vga_puts("$ ");
+
+    for (;;) {
+        int key = kb_getkey();
+        if (!key) continue;
+
+        if (key == KEY_CTRL_J) break;
+
+        if (key == '\n' || key == '\r') {
+            input[len] = '\0';
+            vga_putchar('\n');
+            if (len > 0) shell_execute(input);
+            vga_putchar('\n');
+            vga_puts("$ ");
+            len = 0;
+            continue;
+        }
+
+        if (key == '\b') {
+            if (len > 0) { len--; vga_putchar('\b'); }
+            continue;
+        }
+
+        if (key >= 0x20 && key < 0x7F) {
+            if (len < (int)sizeof(input) - 1) {
+                input[len++] = (char)key;
+                vga_putchar((char)key);
+            }
+        }
+    }
+
+    vga_redir_end();
+}
+
+static void cmd_sxgui(void) {
+    const uint8_t desk_fg = CLR_BLACK;
+    const uint8_t desk_bg = CLR_GREEN;
+
+    for (size_t y = 0; y < VGA_ROWS - 1; y++)
+        for (size_t x = 0; x < VGA_COLS; x++)
+            vga_put_at(x, y, ' ', desk_fg, desk_bg);
+
+    sxgui_draw_status_bar();
+
+    size_t cx = 2, cy = 2;
+    size_t px = cx, py = cy;
+    uint16_t prev_cell = vga_buf[cy * VGA_COLS + cx];
+    uint16_t cursor_cell = vga_entry('_', (uint8_t)((desk_bg << 4) | (CLR_WHITE & 0x0F)));
+    vga_put_cell(cx, cy, cursor_cell);
+
+    for (;;) {
+        vga_row = cy;
+        vga_col = cx;
+        vga_update_cursor();
+
+        int key = kb_getkey();
+        if (!key) continue;
+
+        vga_put_cell(px, py, prev_cell);
+
+        if (key == KEY_CTRL_J) break;
+        if (key == KEY_CTRL_T) {
+            sxterm_run();
+        } else if (key == KEY_UP) {
+            if (cy > 0) cy--;
+        } else if (key == KEY_DOWN) {
+            if (cy + 2 < VGA_ROWS) cy++;
+        } else if (key == KEY_LEFT) {
+            if (cx > 0) cx--;
+        } else if (key == KEY_RIGHT) {
+            if (cx + 1 < VGA_COLS) cx++;
+        } else if (key == '\b') {
+            if (cx > 0) {
+                cx--;
+                vga_put_at(cx, cy, ' ', desk_fg, desk_bg);
+            }
+        } else if (key == '\n' || key == '\r') {
+            cx = 0;
+            if (cy + 2 < VGA_ROWS) cy++;
+        } else if (key >= 0x20 && key < 0x7F) {
+            vga_put_at(cx, cy, (char)key, desk_fg, desk_bg);
+            if (cx + 1 < VGA_COLS) cx++;
+        }
+
+        px = cx;
+        py = cy;
+        prev_cell = vga_buf[cy * VGA_COLS + cx];
+        vga_put_cell(cx, cy, cursor_cell);
+
+        sxgui_draw_status_bar();
+    }
+
+    vga_init();
+    vga_set_color(CLR_WHITE, CLR_BLACK);
+}
+
+
+
 static void cmd_clear(void) {
     vga_init();
 }
 
-// ── ver ──────────────────────────────────────────────────────────
-// Shows kernel version, build info, and current user.
+
+
 static void cmd_ver(void) {
     vga_puts("\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
-    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.0.1\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.1.0\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86 (i686) protected mode\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
     vga_set_color(CLR_LGRAY,  CLR_BLACK);
 }
 
-// ── cpuid ────────────────────────────────────────────────────────
-// Reads CPU vendor string and brand name via the CPUID instruction.
+static void cmd_neofetch(void) {
+    vga_puts("\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.1.0\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86 (i686) protected mode\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
+    vga_set_color(CLR_LGRAY,  CLR_BLACK);
+}
+
+
+
 static void cmd_cpuid(void) {
-    // Vendor string: CPUID leaf 0
+    
     uint32_t eax, ebx, ecx, edx;
     char vendor[13];
     __asm__ volatile (
@@ -349,13 +913,13 @@ static void cmd_cpuid(void) {
         : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
         : "a"(0)
     );
-    // Vendor is packed as EBX+EDX+ECX (in that order)
+    
     for (int i = 0; i < 4; i++) vendor[i]     = (char)((ebx >> (i * 8)) & 0xFF);
     for (int i = 0; i < 4; i++) vendor[i + 4] = (char)((edx >> (i * 8)) & 0xFF);
     for (int i = 0; i < 4; i++) vendor[i + 8] = (char)((ecx >> (i * 8)) & 0xFF);
     vendor[12] = '\0';
 
-    // Brand string: CPUID leaves 0x80000002–0x80000004 (3 × 16 bytes = 48 chars)
+    
     char brand[49];
     uint32_t *b = (uint32_t *)brand;
     for (int leaf = 0; leaf < 3; leaf++) {
@@ -369,7 +933,7 @@ static void cmd_cpuid(void) {
     }
     brand[48] = '\0';
 
-    // Trim leading spaces from brand string (Intel pads with spaces)
+    
     const char *brand_trim = brand;
     while (*brand_trim == ' ') brand_trim++;
 
@@ -379,9 +943,9 @@ static void cmd_cpuid(void) {
     vga_set_color(CLR_LGRAY,  CLR_BLACK);
 }
 
-// ── time ─────────────────────────────────────────────────────────
-// Reads the real-time clock from CMOS registers and prints HH:MM:SS.
-// The RTC may store values in BCD — we handle both modes.
+
+
+
 static uint8_t cmos_read(uint8_t reg) {
     outb(0x70, reg);
     return inb(0x71);
@@ -391,14 +955,13 @@ static uint8_t bcd_to_bin(uint8_t bcd) {
     return (uint8_t)(((bcd >> 4) & 0x0F) * 10 + (bcd & 0x0F));
 }
 
-// Print a two-digit zero-padded number
+
 static void print_d2(uint8_t v) {
     vga_putchar((char)('0' + v / 10));
     vga_putchar((char)('0' + v % 10));
 }
 
-static void cmd_time(void) {
-    // Wait until the RTC is not in the middle of an update
+static void cmd_time(void) {   
     while (cmos_read(0x0A) & 0x80);
 
     uint8_t sec  = cmos_read(0x00);
@@ -408,7 +971,6 @@ static void cmd_time(void) {
     uint8_t mon  = cmos_read(0x08);
     uint8_t year = cmos_read(0x09);
 
-    // Register B bit 2: 0 = BCD, 1 = binary
     uint8_t regB = cmos_read(0x0B);
     if (!(regB & 0x04)) {
         sec  = bcd_to_bin(sec);
@@ -419,7 +981,6 @@ static void cmd_time(void) {
         year = bcd_to_bin(year);
     }
 
-    // RTC year is 2-digit; assume 2000s
     uint16_t full_year = (uint16_t)(2000 + year);
 
     vga_puts("\n  ");
@@ -430,7 +991,6 @@ static void cmd_time(void) {
     vga_puts("  ");
     print_d2(day);  vga_putchar('/');
     print_d2(mon);  vga_putchar('/');
-    // Print 4-digit year
     vga_putchar((char)('0' + full_year / 1000));
     vga_putchar((char)('0' + (full_year % 1000) / 100));
     vga_putchar((char)('0' + (full_year % 100) / 10));
@@ -439,9 +999,6 @@ static void cmd_time(void) {
     vga_set_color(CLR_LGRAY, CLR_BLACK);
 }
 
-// ┌─────────────────────────────────────────────────────────┐
-// │              COMMAND TABLE — edit below                  │
-// └─────────────────────────────────────────────────────────┘
 static Command commands[] = {
     { "help", "Show this help message",     cmd_help },
     { "halt", "Shut down the kernel / shell",   cmd_halt },
@@ -449,21 +1006,19 @@ static Command commands[] = {
     { "kpc", "List of kernel panic codes for debugging.",   cmd_kpc},
     { "reboot", "Reboot the system", cmd_reboot },
     { "echo", "echo the given raw string", cmd_echo },
+    { "color", "Set text color (0x0..0x4 or reset)", cmd_color },
+    { "calculate", "Evaluate integer expression (ex: 2 + 2)", cmd_calculate },
+    { "call", "Run another command (supports ';')", cmd_call },
+    { "sxgui", "Launch Sx desktop (Ctrl+J to quit)", cmd_sxgui },
     { "clear",  "Clear the screen",                          cmd_clear  },  
     { "ver",    "Show kernel and system version info",       cmd_ver    },
     { "cpuid",  "Show CPU vendor and brand string",          cmd_cpuid  },
     { "time",   "Show current date and time from RTC",       cmd_time   },
-    // { "mycommand", "Description here", cmd_mycommand },
+    { "neofetch", "custom neofetch for SilkOS",    cmd_neofetch},
+    { "beep",    "Play a tone: beep <vol 1-100> <freq Hz> <ms>", cmd_beep },
 };
-// ┌─────────────────────────────────────────────────────────┐
-// │                    end of table                          │
-// └─────────────────────────────────────────────────────────┘
 
 #define CMD_COUNT ((size_t)(sizeof(commands) / sizeof(commands[0])))
-
-// ============================================================
-// 6. Built-in Command Implementations
-// ============================================================
 
 static void cmd_help(void) {
     vga_puts("\n");
@@ -476,8 +1031,7 @@ static void cmd_help(void) {
         vga_puts("  ");
         vga_set_color(CLR_LGREEN, CLR_BLACK);
         vga_puts(commands[i].name);
-        vga_set_color(CLR_LGRAY, CLR_BLACK);
-        // Pad to align descriptions
+        vga_set_color(CLR_LGRAY, CLR_BLACK);       
         size_t pad = 12 - kstrlen(commands[i].name);
         for (size_t p = 0; p < pad; p++) vga_putchar(' ');
         vga_puts(commands[i].desc);
@@ -496,32 +1050,28 @@ static void cmd_halt(void) {
     kernel_running = false;
 }
 
-// Paste this handler alongside your other cmd_* functions:
 
-// ============================================================
-// 7. Shell Engine
-// ============================================================
 
 #define INPUT_MAX    256
-#define HISTORY_CAP   16   // number of history entries to keep
+#define HISTORY_CAP   16   
 
 static char history[HISTORY_CAP][INPUT_MAX];
-static int  history_count = 0;   // how many entries are stored
-static int  history_nav   = -1;  // -1 = not browsing history
+static int  history_count = 0;   
+static int  history_nav   = -1;  
 
 static void history_push(const char *cmd) {
     if (history_count < HISTORY_CAP) {
         kmemcpy(history[history_count], cmd, kstrlen(cmd) + 1);
         history_count++;
     } else {
-        // Discard oldest, shift everything down
+        
         for (int i = 0; i < HISTORY_CAP - 1; i++)
             kmemcpy(history[i], history[i + 1], INPUT_MAX);
         kmemcpy(history[HISTORY_CAP - 1], cmd, kstrlen(cmd) + 1);
     }
 }
 
-// Erase `n` characters visually: backspace, space, backspace
+
 static void shell_erase_chars(int n) {
     for (int i = 0; i < n; i++) {
         vga_putchar('\b');
@@ -531,33 +1081,10 @@ static void shell_erase_chars(int n) {
 }
 
 static void shell_print_prompt(void) {
-    vga_set_color(CLR_LGREEN, CLR_BLACK);
-    vga_puts("\nsilk");
-    vga_set_color(CLR_LCYAN, CLR_BLACK);
-    vga_puts("> ");
-    vga_set_color(CLR_WHITE, CLR_BLACK);
+    vga_puts("\nsilk> ");
 }
 
-/*static void shell_execute(const char *line) {
-    // Trim leading spaces
-    while (*line == ' ') line++;
-    if (*line == '\0') return;
 
-    for (size_t i = 0; i < CMD_COUNT; i++) {
-        if (kstrcmp(line, commands[i].name) == 0) {
-            commands[i].fn();
-            return;
-        }
-    }
-
-    vga_puts("\n  ");
-    vga_set_color(CLR_LRED, CLR_BLACK);
-    vga_puts("Unknown command: ");
-    vga_set_color(CLR_LGRAY, CLR_BLACK);
-    vga_puts(line);
-    vga_puts("  (try 'help')\n");
-    vga_set_color(CLR_LGRAY, CLR_BLACK);
-}**/
 
 static void shell_execute(const char *line) {
     while (*line == ' ') line++;
@@ -566,19 +1093,19 @@ static void shell_execute(const char *line) {
     for (size_t i = 0; i < CMD_COUNT; i++) {
         size_t nlen = kstrlen(commands[i].name);
         if (kstrcmp(line, commands[i].name) == 0) {
-            // Exact match — no arguments
+            
             cmd_args = "";
             commands[i].fn();
             return;
         }
-        // Match "name " prefix — everything after is the args
+        
         bool prefix_match = true;
         for (size_t j = 0; j < nlen; j++) {
             if (line[j] != commands[i].name[j]) { prefix_match = false; break; }
         }
         if (prefix_match && line[nlen] == ' ') {
             const char *args = line + nlen + 1;
-            while (*args == ' ') args++;   // trim leading spaces
+            while (*args == ' ') args++;   
             cmd_args = args;
             commands[i].fn();
             return;
@@ -599,7 +1126,6 @@ void shell_run(void) {
     int  input_len = 0;
 
     vga_set_color(CLR_LGRAY, CLR_BLACK);
-    vga_puts("  Type 'help' for a list of commands.\n");
 
     shell_print_prompt();
 
@@ -607,7 +1133,7 @@ void shell_run(void) {
         int key = kb_getkey();
         if (!key) continue;
 
-        // ── Enter ────────────────────────────────────────────
+        
         if (key == '\n' || key == '\r') {
             input[input_len] = '\0';
             if (input_len > 0) {
@@ -618,7 +1144,7 @@ void shell_run(void) {
             input_len = 0;
             if (kernel_running) shell_print_prompt();
 
-        // ── Backspace ────────────────────────────────────────
+        
         } else if (key == '\b') {
             if (input_len > 0) {
                 input_len--;
@@ -627,7 +1153,7 @@ void shell_run(void) {
                 vga_putchar('\b');
             }
 
-        // ── Up arrow: go back in history ─────────────────────
+        
         } else if (key == KEY_UP) {
             if (history_count == 0) continue;
 
@@ -642,7 +1168,7 @@ void shell_run(void) {
             input_len = (int)hlen;
             vga_puts(input);
 
-        // ── Down arrow: go forward in history ────────────────
+        
         } else if (key == KEY_DOWN) {
             if (history_nav == -1) continue;
             history_nav++;
@@ -659,7 +1185,7 @@ void shell_run(void) {
                 vga_puts(input);
             }
 
-        // ── Printable character ───────────────────────────────
+        
         } else if (key >= 0x20 && key < 0x7F) {
             if (input_len < INPUT_MAX - 1) {
                 input[input_len++] = (char)key;
@@ -669,27 +1195,42 @@ void shell_run(void) {
     }
 }
 
-// ============================================================
-// 8. Kernel Entry Point
-// ============================================================
+
+
+
 
 void kernel_main(void) {
+    serial_init();
+    serial_write("SilkOS: kernel_main entered\n");
     vga_init();
 
-    // ── Boot banner ───────────────────────────────────────────
+    
     vga_set_color(CLR_LCYAN, CLR_BLACK);
-    vga_puts("  ╔══════════════════════════════════════════╗\n");
-    vga_puts("  ║                                          ║\n");
-    vga_set_color(CLR_WHITE, CLR_BLACK);
-    vga_puts("  ║     Booted SilkOS Kernel v0.0.1          ║\n");
+    vga_puts("Booting SilkOS kernel...\n");
+    usleep_mil(200);
+    vga_puts("Setting basic shell config...ok\n");
+    usleep_mil(89);
+    vga_set_color(CLR_LMAGENTA, CLR_BLACK);
+    vga_puts("\n\nWelcome to SilkOS!\n\n");
     vga_set_color(CLR_LCYAN, CLR_BLACK);
-    vga_puts("  ║                                          ║\n");
-    vga_puts("  ╚══════════════════════════════════════════╝\n\n");
+    usleep_mil(400);
+    vga_puts("Working.");
+    usleep_mil(100);
+    vga_puts(".");
+    usleep_mil(100);
+    vga_puts(".");
+    usleep_mil(100);
+    vga_puts(".");
+    usleep_mil(100);
+    vga_puts(".\n");
+    usleep_mil(18);
+    vga_puts("Finding commands\n\n");
+    usleep_mil(12);
+    vga_puts("Finished booting. Run help or visit repinafamily.us/silk/manual for help.");
     vga_set_color(CLR_LGRAY, CLR_BLACK);
 
     shell_run();
 
-    // Shell has exited (halt command) — power down or spin
     __asm__ volatile ("cli");
     for (;;) __asm__ volatile ("hlt");
 }
