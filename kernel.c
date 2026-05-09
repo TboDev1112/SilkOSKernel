@@ -352,22 +352,23 @@ static void kmemset(void *dst, uint8_t val, size_t n) {
 /* ── ELF64 Loader ──────────────────────────────────────────────────────────
  *
  * Embedded binaries are bundled into the kernel .rodata at build time.
- * To execute one they must be ET_EXEC ELF64 x86-64 binaries whose
- * PT_LOAD virtual addresses fall inside the identity-mapped first 1 GB.
+ * Both ET_EXEC and ET_DYN (static PIE) x86-64 binaries are supported.
+ * Binaries that require a dynamic linker (PT_DYNAMIC segment) are rejected.
  *
- * A minimal SilkOS user program looks like:
+ * Compile a program for SilkOS exec:
  *
- *   // hello.c  —  compile with:
- *   //   x86_64-elf-gcc -ffreestanding -nostdlib -static \
- *   //       -Ttext 0x400000 -o hello.elf hello.c
- *   __attribute__((section(".text._start")))
- *   int _start(void) {
- *       // do work; return an exit code
- *       return 0;
- *   }
+ *   Option A — traditional static executable (simplest):
+ *     gcc -ffreestanding -nostdlib -static -no-pie \
+ *         -Ttext 0x400000 -e _start -o myapp.elf myapp.c
  *
- * The kernel calls the entry point as  int entry(void)  and prints the
- * returned value as the exit code.
+ *   Option B — static PIE (default modern GCC output, also works):
+ *     gcc -ffreestanding -nostdlib -static \
+ *         -e _start -o myapp.elf myapp.c
+ *
+ * Entry point signature:  int _start(void)   (return value = exit code)
+ *
+ * All PT_LOAD virtual addresses must fall inside the identity-mapped
+ * first 1 GB and must not overlap the kernel (loaded at 1 MB).
  * ─────────────────────────────────────────────────────────────────────── */
 
 /* ELF64 constants */
@@ -378,8 +379,10 @@ static void kmemset(void *dst, uint8_t val, size_t n) {
 #define ELFMAG3     'F'
 #define ELFCLASS64  2u
 #define ET_EXEC     2u
+#define ET_DYN      3u
 #define EM_X86_64   62u
 #define PT_LOAD     1u
+#define PT_DYNAMIC  2u
 
 typedef struct {
     uint8_t  e_ident[EI_NIDENT];
@@ -409,6 +412,28 @@ typedef struct {
     uint64_t p_align;
 } Elf64_Phdr;
 
+/* RELA relocation entry (used for R_X86_64_RELATIVE in static PIE) */
+typedef struct {
+    uint64_t r_offset;   /* virtual address of the word to patch  */
+    uint64_t r_info;     /* symbol index (high 32) + type (low 32) */
+    int64_t  r_addend;   /* addend                                 */
+} Elf64_Rela;
+
+/* Dynamic section entry */
+typedef struct {
+    int64_t  d_tag;
+    uint64_t d_val;
+} Elf64_Dyn;
+
+#define ELF64_R_TYPE(i)     ((i) & 0xFFFFFFFFULL)
+#define R_X86_64_RELATIVE   8u   /* *addr = load_base + addend */
+
+/* Dynamic tags we need for relocation */
+#define DT_NULL    0
+#define DT_RELA    7    /* address of .rela.dyn  */
+#define DT_RELASZ  8    /* byte size of .rela.dyn */
+#define DT_RELAENT 9    /* size of one Elf64_Rela  */
+
 /* Print a size_t value (unsigned, 64-bit safe) */
 static void kputs_sz(size_t v) {
     char buf[24];
@@ -421,17 +446,71 @@ static void kputs_sz(size_t v) {
     for (int j = i - 1; j >= 0; j--) vga_putchar(buf[j]);
 }
 
-/* Return true when the buffer looks like a valid ELF64 x86-64 executable. */
+/*
+ * Validate ELF magic, class, type, and machine.
+ * Accepts ET_EXEC (traditional) and ET_DYN (static PIE).
+ * Detailed rejection messages help the user fix their compile flags.
+ */
 static bool elf64_check(const uint8_t *data, size_t size) {
-    if (size < sizeof(Elf64_Ehdr)) return false;
+    if (size < sizeof(Elf64_Ehdr)) {
+        vga_puts("  exec: file too small to be an ELF\n");
+        return false;
+    }
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
     if (eh->e_ident[0] != ELFMAG0 || eh->e_ident[1] != ELFMAG1 ||
-        eh->e_ident[2] != ELFMAG2 || eh->e_ident[3] != ELFMAG3)
+        eh->e_ident[2] != ELFMAG2 || eh->e_ident[3] != ELFMAG3) {
+        vga_puts("  exec: not an ELF file (bad magic)\n");
         return false;
-    if (eh->e_ident[4] != ELFCLASS64) { vga_puts("  exec: not a 64-bit ELF\n");        return false; }
-    if (eh->e_type     != ET_EXEC)     { vga_puts("  exec: not an executable ELF\n");   return false; }
-    if (eh->e_machine  != EM_X86_64)   { vga_puts("  exec: not an x86-64 ELF\n");       return false; }
+    }
+    if (eh->e_ident[4] != ELFCLASS64) {
+        vga_puts("  exec: not a 64-bit ELF (need ELFCLASS64)\n");
+        return false;
+    }
+    if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) {
+        vga_puts("  exec: ELF type is not executable\n");
+        vga_puts("        (expected ET_EXEC or ET_DYN)\n");
+        return false;
+    }
+    if (eh->e_machine != EM_X86_64) {
+        vga_puts("  exec: not an x86-64 ELF (wrong e_machine)\n");
+        return false;
+    }
     return true;
+}
+
+/*
+ * Apply R_X86_64_RELATIVE relocations from a PT_DYNAMIC segment.
+ * Called for ET_DYN (static PIE) binaries with load_base = 0
+ * (we place segments at their stated vaddrs, so the slide is 0).
+ *
+ * For a slide of 0, every R_X86_64_RELATIVE reduces to:
+ *   *target = addend    (which the compiler already stored there,
+ *                        so this is a no-op in the common case)
+ * We still run it so programs compiled without -Ttext work correctly.
+ */
+static void elf64_apply_relocs(const Elf64_Phdr *dyn_ph, uint64_t load_base) {
+    const Elf64_Dyn *dyn = (const Elf64_Dyn *)(uintptr_t)dyn_ph->p_vaddr;
+
+    uint64_t rela_addr = 0, rela_sz = 0, rela_ent = sizeof(Elf64_Rela);
+
+    for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_RELA:    rela_addr = d->d_val; break;
+            case DT_RELASZ:  rela_sz   = d->d_val; break;
+            case DT_RELAENT: rela_ent  = d->d_val; break;
+        }
+    }
+
+    if (!rela_addr || !rela_sz || !rela_ent) return;
+
+    const uint8_t *base = (const uint8_t *)(uintptr_t)rela_addr;
+    for (uint64_t off = 0; off + rela_ent <= rela_sz; off += rela_ent) {
+        const Elf64_Rela *rel = (const Elf64_Rela *)(base + off);
+        if (ELF64_R_TYPE(rel->r_info) == R_X86_64_RELATIVE) {
+            uint64_t *target = (uint64_t *)(uintptr_t)(load_base + rel->r_offset);
+            *target = load_base + (uint64_t)rel->r_addend;
+        }
+    }
 }
 
 /*
@@ -439,9 +518,7 @@ static bool elf64_check(const uint8_t *data, size_t size) {
  * Returns the program's exit code, or -1 on load error.
  *
  * NOTE: No isolation — the program runs in ring 0 and shares the kernel's
- * address space. Virtual addresses must fall in the identity-mapped first
- * 1 GB. The program may call back into kernel functions via direct call
- * if it knows their addresses (link-time coupling).
+ * address space. Use only for trusted, freestanding ring-0 code.
  */
 static int elf64_exec(const uint8_t *data, size_t size) {
     if (!elf64_check(data, size)) return -1;
@@ -455,7 +532,26 @@ static int elf64_exec(const uint8_t *data, size_t size) {
         return -1;
     }
 
-    /* Map every PT_LOAD segment */
+    /* First pass: reject dynamically-linked binaries and locate PT_DYNAMIC */
+    const Elf64_Phdr *dyn_ph = (const Elf64_Phdr *)0;
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const Elf64_Phdr *ph =
+            (const Elf64_Phdr *)(data + eh->e_phoff + (uint64_t)i * sizeof(Elf64_Phdr));
+        if (ph->p_type == PT_DYNAMIC) {
+            if (eh->e_type == ET_DYN) {
+                /* Static PIE: has PT_DYNAMIC but no shared-lib deps.
+                 * We use it only to locate the RELA relocation table. */
+                dyn_ph = ph;
+            } else {
+                /* ET_EXEC with PT_DYNAMIC means a real shared-lib binary */
+                vga_puts("  exec: binary needs a dynamic linker — not supported\n");
+                vga_puts("        recompile with: -static -no-pie\n");
+                return -1;
+            }
+        }
+    }
+
+    /* Second pass: map all PT_LOAD segments */
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         const Elf64_Phdr *ph =
             (const Elf64_Phdr *)(data + eh->e_phoff + (uint64_t)i * sizeof(Elf64_Phdr));
@@ -466,9 +562,17 @@ static int elf64_exec(const uint8_t *data, size_t size) {
             vga_puts("  exec: segment data exceeds file size\n");
             return -1;
         }
-        /* Basic overflow guard */
         if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr) {
             vga_puts("  exec: segment address overflow\n");
+            return -1;
+        }
+        /* Ensure the segment is inside the identity-mapped first 1 GB
+         * and well above the kernel (loaded at 1 MB / 0x100000). */
+        if (ph->p_vaddr < 0x200000ULL ||
+            ph->p_vaddr + ph->p_memsz > 0x40000000ULL) {
+            vga_puts("  exec: segment vaddr out of safe range\n");
+            vga_puts("        (must be 0x200000 – 0x40000000)\n");
+            vga_puts("        recompile with: -Ttext 0x400000\n");
             return -1;
         }
 
@@ -476,14 +580,15 @@ static int elf64_exec(const uint8_t *data, size_t size) {
         const uint8_t *src = data + ph->p_offset;
 
         kmemcpy(dst, src, (size_t)ph->p_filesz);
-
-        /* Zero-fill the BSS portion (.memsz > .filesz) */
         if (ph->p_memsz > ph->p_filesz)
-            kmemset(dst + ph->p_filesz, 0,
-                    (size_t)(ph->p_memsz - ph->p_filesz));
+            kmemset(dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
     }
 
-    /* Call the entry point: int entry(void) */
+    /* Apply relocations for static PIE (ET_DYN), load_base = 0 because
+     * segments are already placed at their stated virtual addresses. */
+    if (dyn_ph) elf64_apply_relocs(dyn_ph, 0);
+
+    /* Call the entry point:  int entry(void) */
     typedef int (*entry_t)(void);
     entry_t entry = (entry_t)(uintptr_t)eh->e_entry;
     return entry();
@@ -492,6 +597,7 @@ static int elf64_exec(const uint8_t *data, size_t size) {
 /* cmd_files and cmd_exec are defined further down, after kputs_i32 and
  * cmd_args are visible.  Forward declarations appear in the command
  * forward-declaration block. */
+
 
 
 
