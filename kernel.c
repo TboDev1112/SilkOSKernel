@@ -1377,7 +1377,7 @@ static void cmd_help(void) {
     vga_set_color(CLR_LCYAN, CLR_BLACK);
     vga_puts("  Available commands:\n");
     vga_set_color(CLR_LGRAY, CLR_BLACK);
-    vga_puts("  ──────────────────────────────────────\n");
+    vga_puts("\n");
 
     for (size_t i = 0; i < CMD_COUNT; i++) {
         vga_puts("  ");
@@ -1389,7 +1389,7 @@ static void cmd_help(void) {
         vga_puts(commands[i].desc);
         vga_puts("\n");
     }
-    vga_puts("  ──────────────────────────────────────\n");
+    vga_puts("\n");
 }
 
 static bool kernel_running = true;
