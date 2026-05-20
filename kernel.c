@@ -1179,7 +1179,7 @@ static void cmd_clear(void) {
 static void cmd_ver(void) {
     vga_puts("\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
-    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.1.0\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("1.0.0 Codename 'Repina' (stable)\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86-64 long mode\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
     vga_set_color(CLR_LGRAY,  CLR_BLACK);
@@ -1188,7 +1188,7 @@ static void cmd_ver(void) {
 static void cmd_neofetch(void) {
     vga_puts("\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  OS      : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("SilkOS\n");
-    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("0.1.0\n");
+    vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Version : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("1.0.0 Codename 'Repina' (stable)\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Arch    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("x86-64 long mode\n");
     vga_set_color(CLR_LCYAN,  CLR_BLACK); vga_puts("  Boot    : "); vga_set_color(CLR_WHITE, CLR_BLACK); vga_puts("GRUB Multiboot\n");
     vga_set_color(CLR_LGRAY,  CLR_BLACK);
@@ -1296,13 +1296,11 @@ static void cmd_files(void) {
     vga_set_color(CLR_LCYAN, CLR_BLACK);
     vga_puts("  Embedded files:\n");
     vga_set_color(CLR_LGRAY, CLR_BLACK);
-    vga_puts("  ──────────────────────────────────────\n");
 
     if (silk_file_count == 0) {
         vga_puts("  (none)\n");
         vga_puts("  Bundle files with: make EXTRA_FILES=\"a.elf b.bin\"\n");
         vga_puts("                 or: ./build --files a.elf b.bin\n");
-        vga_puts("  ──────────────────────────────────────\n");
         return;
     }
 
@@ -1318,7 +1316,6 @@ static void cmd_files(void) {
         kputs_sz(silk_file_size(&silk_files[i]));
         vga_puts(" bytes\n");
     }
-    vga_puts("  ──────────────────────────────────────\n");
 }
 
 static void cmd_exec(void) {
