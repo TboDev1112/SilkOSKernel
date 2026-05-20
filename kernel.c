@@ -13,9 +13,6 @@ static inline void cpu_relax(void) {
 }
 
 void usleep_mil(uint32_t ms) {
-    // Tunable constant: loops per millisecond.
-    // Start with this value in QEMU; adjust if needed.
-    // If it sleeps too fast, increase it. Too slow, decrease it.
     const uint32_t LOOPS_PER_MS = 50000;
 
     for (uint32_t t = 0; t < ms; t++) {
@@ -36,28 +33,23 @@ static inline uint8_t inb(uint16_t port) {
     return ret;
 }
 
-// PC Speaker via PIT channel 2
-// The PIT runs at 1,193,182 Hz; dividing by the desired frequency gives the
-// counter reload value for a 50% duty-cycle square wave (mode 3).
 #define PIT_HZ 1193182UL
 
 static void pc_speaker_set_freq(uint32_t freq) {
     uint32_t div = (uint32_t)(PIT_HZ / freq);
-    outb(0x43, 0xB6);                              // ch2, lobyte/hibyte, mode 3
+    outb(0x43, 0xB6);                              
     outb(0x42, (uint8_t)(div & 0xFF));
     outb(0x42, (uint8_t)((div >> 8) & 0xFF));
 }
 
 static void pc_speaker_on(void) {
-    outb(0x61, inb(0x61) | 0x03);                 // gate PIT ch2 + enable speaker
+    outb(0x61, inb(0x61) | 0x03);                 
 }
 
 static void pc_speaker_off(void) {
     outb(0x61, inb(0x61) & (uint8_t)~0x03);
 }
 
-// PWM volume: within each ~1 ms cycle, hold speaker on for vol% of the
-// LOOPS_PER_MS busy-wait loops to approximate a softer tone.
 static void beep_play(uint32_t vol, uint32_t freq, uint32_t ms) {
     if (!vol || !freq || !ms) return;
     if (vol > 100) vol = 100;
@@ -71,7 +63,7 @@ static void beep_play(uint32_t vol, uint32_t freq, uint32_t ms) {
         return;
     }
 
-    const uint32_t CYCLE = 50000;              // matches LOOPS_PER_MS in usleep_mil
+    const uint32_t CYCLE = 50000;       
     uint32_t on_loops  = (CYCLE * vol) / 100;
     uint32_t off_loops = CYCLE - on_loops;
 
@@ -346,32 +338,6 @@ static void kmemset(void *dst, uint8_t val, size_t n) {
     for (size_t i = 0; i < n; i++) d[i] = val;
 }
 
-
-
-
-/* ── ELF64 Loader ──────────────────────────────────────────────────────────
- *
- * Embedded binaries are bundled into the kernel .rodata at build time.
- * Both ET_EXEC and ET_DYN (static PIE) x86-64 binaries are supported.
- * Binaries that require a dynamic linker (PT_DYNAMIC segment) are rejected.
- *
- * Compile a program for SilkOS exec:
- *
- *   Option A — traditional static executable (simplest):
- *     gcc -ffreestanding -nostdlib -static -no-pie \
- *         -Ttext 0x400000 -e _start -o myapp.elf myapp.c
- *
- *   Option B — static PIE (default modern GCC output, also works):
- *     gcc -ffreestanding -nostdlib -static \
- *         -e _start -o myapp.elf myapp.c
- *
- * Entry point signature:  int _start(void)   (return value = exit code)
- *
- * All PT_LOAD virtual addresses must fall inside the identity-mapped
- * first 1 GB and must not overlap the kernel (loaded at 1 MB).
- * ─────────────────────────────────────────────────────────────────────── */
-
-/* ELF64 constants */
 #define EI_NIDENT   16
 #define ELFMAG0     0x7Fu
 #define ELFMAG1     'E'
@@ -412,29 +378,25 @@ typedef struct {
     uint64_t p_align;
 } Elf64_Phdr;
 
-/* RELA relocation entry (used for R_X86_64_RELATIVE in static PIE) */
 typedef struct {
-    uint64_t r_offset;   /* virtual address of the word to patch  */
-    uint64_t r_info;     /* symbol index (high 32) + type (low 32) */
-    int64_t  r_addend;   /* addend                                 */
+    uint64_t r_offset;   
+    uint64_t r_info;     
+    int64_t  r_addend;
 } Elf64_Rela;
 
-/* Dynamic section entry */
 typedef struct {
     int64_t  d_tag;
     uint64_t d_val;
 } Elf64_Dyn;
 
 #define ELF64_R_TYPE(i)     ((i) & 0xFFFFFFFFULL)
-#define R_X86_64_RELATIVE   8u   /* *addr = load_base + addend */
+#define R_X86_64_RELATIVE   8u   
 
-/* Dynamic tags we need for relocation */
 #define DT_NULL    0
-#define DT_RELA    7    /* address of .rela.dyn  */
-#define DT_RELASZ  8    /* byte size of .rela.dyn */
-#define DT_RELAENT 9    /* size of one Elf64_Rela  */
+#define DT_RELA    7    
+#define DT_RELASZ  8    
+#define DT_RELAENT 9    
 
-/* Print a size_t value (unsigned, 64-bit safe) */
 static void kputs_sz(size_t v) {
     char buf[24];
     int  i = 0;
@@ -446,11 +408,6 @@ static void kputs_sz(size_t v) {
     for (int j = i - 1; j >= 0; j--) vga_putchar(buf[j]);
 }
 
-/*
- * Validate ELF magic, class, type, and machine.
- * Accepts ET_EXEC (traditional) and ET_DYN (static PIE).
- * Detailed rejection messages help the user fix their compile flags.
- */
 static bool elf64_check(const uint8_t *data, size_t size) {
     if (size < sizeof(Elf64_Ehdr)) {
         vga_puts("  exec: file too small to be an ELF\n");
@@ -478,16 +435,6 @@ static bool elf64_check(const uint8_t *data, size_t size) {
     return true;
 }
 
-/*
- * Apply R_X86_64_RELATIVE relocations from a PT_DYNAMIC segment.
- * Called for ET_DYN (static PIE) binaries with load_base = 0
- * (we place segments at their stated vaddrs, so the slide is 0).
- *
- * For a slide of 0, every R_X86_64_RELATIVE reduces to:
- *   *target = addend    (which the compiler already stored there,
- *                        so this is a no-op in the common case)
- * We still run it so programs compiled without -Ttext work correctly.
- */
 static void elf64_apply_relocs(const Elf64_Phdr *dyn_ph, uint64_t load_base) {
     const Elf64_Dyn *dyn = (const Elf64_Dyn *)(uintptr_t)dyn_ph->p_vaddr;
 
@@ -513,37 +460,25 @@ static void elf64_apply_relocs(const Elf64_Phdr *dyn_ph, uint64_t load_base) {
     }
 }
 
-/*
- * Load every PT_LOAD segment into memory and call the entry point.
- * Returns the program's exit code, or -1 on load error.
- *
- * NOTE: No isolation — the program runs in ring 0 and shares the kernel's
- * address space. Use only for trusted, freestanding ring-0 code.
- */
 static int elf64_exec(const uint8_t *data, size_t size) {
     if (!elf64_check(data, size)) return -1;
 
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
 
-    /* Validate program-header table bounds */
     uint64_t ph_end = eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr);
     if (ph_end > (uint64_t)size) {
         vga_puts("  exec: program header table out of bounds\n");
         return -1;
     }
 
-    /* First pass: reject dynamically-linked binaries and locate PT_DYNAMIC */
     const Elf64_Phdr *dyn_ph = (const Elf64_Phdr *)0;
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         const Elf64_Phdr *ph =
             (const Elf64_Phdr *)(data + eh->e_phoff + (uint64_t)i * sizeof(Elf64_Phdr));
         if (ph->p_type == PT_DYNAMIC) {
             if (eh->e_type == ET_DYN) {
-                /* Static PIE: has PT_DYNAMIC but no shared-lib deps.
-                 * We use it only to locate the RELA relocation table. */
                 dyn_ph = ph;
             } else {
-                /* ET_EXEC with PT_DYNAMIC means a real shared-lib binary */
                 vga_puts("  exec: binary needs a dynamic linker — not supported\n");
                 vga_puts("        recompile with: -static -no-pie\n");
                 return -1;
@@ -551,7 +486,6 @@ static int elf64_exec(const uint8_t *data, size_t size) {
         }
     }
 
-    /* Second pass: map all PT_LOAD segments */
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         const Elf64_Phdr *ph =
             (const Elf64_Phdr *)(data + eh->e_phoff + (uint64_t)i * sizeof(Elf64_Phdr));
@@ -566,8 +500,6 @@ static int elf64_exec(const uint8_t *data, size_t size) {
             vga_puts("  exec: segment address overflow\n");
             return -1;
         }
-        /* Ensure the segment is inside the identity-mapped first 1 GB
-         * and well above the kernel (loaded at 1 MB / 0x100000). */
         if (ph->p_vaddr < 0x200000ULL ||
             ph->p_vaddr + ph->p_memsz > 0x40000000ULL) {
             vga_puts("  exec: segment vaddr out of safe range\n");
@@ -584,19 +516,13 @@ static int elf64_exec(const uint8_t *data, size_t size) {
             kmemset(dst + ph->p_filesz, 0, (size_t)(ph->p_memsz - ph->p_filesz));
     }
 
-    /* Apply relocations for static PIE (ET_DYN), load_base = 0 because
-     * segments are already placed at their stated virtual addresses. */
     if (dyn_ph) elf64_apply_relocs(dyn_ph, 0);
 
-    /* Call the entry point:  int entry(void) */
     typedef int (*entry_t)(void);
     entry_t entry = (entry_t)(uintptr_t)eh->e_entry;
     return entry();
 }
 
-/* cmd_files and cmd_exec are defined further down, after kputs_i32 and
- * cmd_args are visible.  Forward declarations appear in the command
- * forward-declaration block. */
 
 
 
@@ -645,7 +571,7 @@ static uint8_t kb_read_raw(void) {
         uint8_t st = inb(0x64);
         if (!(st & 0x01)) continue;
         uint8_t data = inb(0x60);
-        if (!(st & 0x20)) return data;  /* skip mouse data */
+        if (!(st & 0x20)) return data;  
     }
 }
 
@@ -1079,26 +1005,24 @@ static void sxterm_run(void) {
     vga_redir_end();
 }
 
-/* ── PS/2 Mouse ──────────────────────────────────────────────────────── */
-
 static void ps2_wait_write(void) { while (inb(0x64) & 0x02); }
 static void ps2_wait_read_any(void) { while (!(inb(0x64) & 0x01)); }
 
 static void mouse_cmd(uint8_t cmd) {
     ps2_wait_write(); outb(0x64, 0xD4);
     ps2_wait_write(); outb(0x60, cmd);
-    ps2_wait_read_any(); inb(0x60);  /* discard ACK */
+    ps2_wait_read_any(); inb(0x60);  
 }
 
 static void mouse_init(void) {
-    ps2_wait_write(); outb(0x64, 0xA8);        /* enable aux device */
-    ps2_wait_write(); outb(0x64, 0x20);         /* read command byte */
+    ps2_wait_write(); outb(0x64, 0xA8);        
+    ps2_wait_write(); outb(0x64, 0x20);         
     ps2_wait_read_any();
-    uint8_t cb = inb(0x60) | 0x02;             /* set IRQ12 enable */
-    ps2_wait_write(); outb(0x64, 0x60);         /* write command byte */
+    uint8_t cb = inb(0x60) | 0x02;          
+    ps2_wait_write(); outb(0x64, 0x60);     
     ps2_wait_write(); outb(0x60, cb);
-    mouse_cmd(0xF6);                            /* set defaults */
-    mouse_cmd(0xF4);                            /* enable data reporting */
+    mouse_cmd(0xF6);                            
+    mouse_cmd(0xF4);                        
 }
 
 #define MSCALE 4
@@ -1107,27 +1031,25 @@ static int     mouse_fy = 0;
 static uint8_t mouse_buf[3];
 static int     mouse_buf_pos = 0;
 
-/* Returns true with dx/dy when a full 3-byte packet is decoded */
 static bool mouse_poll(int *out_dx, int *out_dy) {
     uint8_t st = inb(0x64);
-    if ((st & 0x21) != 0x21) return false;  /* need bit0 (data) + bit5 (aux) */
+    if ((st & 0x21) != 0x21) return false;  
     uint8_t b = inb(0x60);
-    if (mouse_buf_pos == 0 && !(b & 0x08)) return false;  /* sync on bit3 */
+    if (mouse_buf_pos == 0 && !(b & 0x08)) return false;  
     mouse_buf[mouse_buf_pos++] = b;
     if (mouse_buf_pos < 3) return false;
     mouse_buf_pos = 0;
-    if (mouse_buf[0] & 0xC0) return false;  /* overflow */
+    if (mouse_buf[0] & 0xC0) return false;  
     *out_dx =  (int)mouse_buf[1] - ((mouse_buf[0] & 0x10) ? 256 : 0);
     *out_dy = -((int)mouse_buf[2] - ((mouse_buf[0] & 0x20) ? 256 : 0));
     return true;
 }
 
-/* Non-blocking keyboard poll; shares shift/caps/ctrl state with kb_getkey */
 static uint8_t kb_ext_pending = 0;
 
 static int kb_poll(void) {
     uint8_t st = inb(0x64);
-    if (!(st & 0x01) || (st & 0x20)) return 0;  /* no data or it's mouse data */
+    if (!(st & 0x01) || (st & 0x20)) return 0;  
     uint8_t sc = inb(0x60);
     if (sc == 0xE0) { kb_ext_pending = 1; return 0; }
     if (kb_ext_pending) {
@@ -1160,7 +1082,6 @@ static int kb_poll(void) {
     return c;
 }
 
-/* Render the pointer: CP437 ► (0x10) with fg/bg swapped relative to cell below */
 static uint16_t make_ptr_cell(uint16_t under) {
     uint8_t color = (uint8_t)(under >> 8);
     uint8_t fg = color & 0x0F;
@@ -1369,8 +1290,6 @@ static void cmd_time(void) {
     vga_puts("  (from RTC)\n");
     vga_set_color(CLR_LGRAY, CLR_BLACK);
 }
-
-/* ── ELF shell commands (here so cmd_args and kputs_i32 are in scope) ──── */
 
 static void cmd_files(void) {
     vga_puts("\n");
