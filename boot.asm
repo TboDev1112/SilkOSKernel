@@ -22,6 +22,9 @@ align 16
 stack_bottom: resb 16384       
 stack_top:
 
+multiboot_mbi:
+    resd 1
+
 
 section .data
 gdt64:
@@ -40,6 +43,11 @@ bits 32
 global _start
 _start:
     mov esp, stack_top
+
+    cmp eax, MB_MAGIC
+    jne .no_mbi
+    mov [multiboot_mbi], ebx
+.no_mbi:
 
     mov edi, pml4_table
     xor eax, eax
@@ -96,6 +104,7 @@ long_mode_start:
 
     mov rsp, stack_top
 
+    mov edi, [multiboot_mbi]
     extern kernel_main
     call kernel_main
 

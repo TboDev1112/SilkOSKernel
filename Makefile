@@ -12,6 +12,17 @@ ISO     := silkos.iso
 ISODIR  := isodir
 
 EXTRA_FILES ?=
+RUN_FILES   ?=
+
+empty       :=
+space       := $(empty) $(empty)
+comma       := ,
+
+ifneq ($(RUN_FILES),)
+  QEMU_INITRD := -initrd $(subst $(space),$(comma),$(RUN_FILES))
+else
+  QEMU_INITRD :=
+endif
 
 CFLAGS  := -std=gnu99 -ffreestanding -O2 -Wall -Wextra \
            -Wno-unused-parameter
@@ -26,7 +37,10 @@ endif
 CFLAGS  += -fno-stack-protector -fno-pie -fno-pic
 LDFLAGS += -no-pie
 
-BASE_OBJS := boot.o kernel.o files_table.o
+CMD_SRCS  := $(wildcard cmd/*.c)
+CMD_OBJS  := $(CMD_SRCS:cmd/%.c=cmd/%.o)
+
+BASE_OBJS := boot.o kernel.o silk_fs.o files_table.o $(CMD_OBJS)
 
 FILE_OBJS := $(addsuffix .embed.o,$(EXTRA_FILES))
 
@@ -37,7 +51,13 @@ all: $(KERNEL)
 boot.o: boot.asm
 	$(AS) -f elf64 $< -o $@
 
-kernel.o: kernel.c silk_fs.h
+kernel.o: kernel.c kernel.h cmd/cmd.h silk_fs.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+silk_fs.o: silk_fs.c silk_fs.h kernel.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+cmd/%.o: cmd/%.c kernel.h cmd/cmd.h silk_fs.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 FORCE:
@@ -71,10 +91,10 @@ files_table.c: .files_list $(EXTRA_FILES)
 	  n=0; for f in $(EXTRA_FILES); do n=$$((n+1)); done; \
 	  if [ "$$n" -eq 0 ]; then \
 	    printf '\n/* No files embedded — rebuild with EXTRA_FILES="..." */\n'; \
-	    printf 'const SilkFile silk_files[1] = { { 0, 0, 0 } };\n'; \
-	    printf 'const size_t   silk_file_count = 0;\n'; \
+	    printf 'const SilkFile silk_embedded[1] = { { 0, 0, 0 } };\n'; \
+	    printf 'const size_t   silk_embedded_count = 0;\n'; \
 	  else \
-	    printf '\nconst SilkFile silk_files[] = {\n'; \
+	    printf '\nconst SilkFile silk_embedded[] = {\n'; \
 	    for f in $(EXTRA_FILES); do \
 	      sym=$$(printf '%s' "$$f" | tr -c 'a-zA-Z0-9' '_'); \
 	      name=$$(basename "$$f"); \
@@ -82,8 +102,8 @@ files_table.c: .files_list $(EXTRA_FILES)
 	        "$$name" "$$sym" "$$sym"; \
 	    done; \
 	    printf '};\n\n'; \
-	    printf 'const size_t silk_file_count =\n'; \
-	    printf '    sizeof(silk_files) / sizeof(silk_files[0]);\n'; \
+	    printf 'const size_t silk_embedded_count =\n'; \
+	    printf '    sizeof(silk_embedded) / sizeof(silk_embedded[0]);\n'; \
 	  fi; \
 	} > $@
 
@@ -105,11 +125,11 @@ iso: $(KERNEL)
 	@echo "  Built:  $(ISO)"
 
 run: $(KERNEL)
-	qemu-system-x86_64 -kernel $(KERNEL) \
+	qemu-system-x86_64 -kernel $(KERNEL) $(QEMU_INITRD) \
 	    -audiodev pa,id=snd -machine pcspk-audiodev=snd
 
 run-iso: iso
-	qemu-system-x86_64 -cdrom $(ISO) \
+	qemu-system-x86_64 -cdrom $(ISO) $(QEMU_INITRD) \
 	    -audiodev pa,id=snd -machine pcspk-audiodev=snd
 
 debug: $(KERNEL)
@@ -119,7 +139,7 @@ debug: $(KERNEL)
 	    --no-reboot
 
 clean:
-	rm -f $(BASE_OBJS) $(KERNEL) $(KERNEL).elf64 $(ISO)
+	rm -f boot.o kernel.o silk_fs.o files_table.o $(CMD_OBJS) $(KERNEL) $(KERNEL).elf64 $(ISO)
 	rm -f files_table.c .files_list
 	rm -f *.embed.o
 	rm -rf $(ISODIR)

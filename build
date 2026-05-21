@@ -2,29 +2,74 @@
 
 set -euo pipefail
 
-FILES=()
+EMBED_FILES=()
+RUN_FILES=()
 ARGS=()
+TARGET=""
+
+usage() {
+    cat <<'EOF'
+Usage: ./build [make-target] [--files f ...] [--embed f ...] [f ...]
+
+  --files   Files passed to QEMU at runtime (-initrd, no rebuild needed)
+  --embed   Files embedded into silkos.bin at build time
+  f ...     When running (run / run-iso), bare paths are treated as --files
+
+Examples:
+  ./build run --files photo.ppm
+  ./build --embed app.elf --files demo.ppm run
+  make run RUN_FILES="image.ppm"
+EOF
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
         --files)
             shift
             while [[ $# -gt 0 && "$1" != --* ]]; do
-                FILES+=("$1")
+                RUN_FILES+=("$1")
                 shift
             done
             ;;
-        *)
+        --embed)
+            shift
+            while [[ $# -gt 0 && "$1" != --* ]]; do
+                EMBED_FILES+=("$1")
+                shift
+            done
+            ;;
+        run|run-iso|debug|iso|all|clean)
+            TARGET="$1"
             ARGS+=("$1")
+            shift
+            ;;
+        *)
+            if [[ "$TARGET" == "run" || "$TARGET" == "run-iso" || "$TARGET" == "debug" ]]; then
+                RUN_FILES+=("$1")
+            else
+                ARGS+=("$1")
+            fi
             shift
             ;;
     esac
 done
 
-if [[ ${#FILES[@]} -gt 0 ]]; then
-    FILES_STR="${FILES[*]}"
-    echo "  Embedding: $FILES_STR"
-    exec make "${ARGS[@]}" EXTRA_FILES="$FILES_STR"
-else
-    exec make "${ARGS[@]}"
+MAKE_ARGS=("${ARGS[@]}")
+
+if [[ ${#EMBED_FILES[@]} -gt 0 ]]; then
+    EMBED_STR="${EMBED_FILES[*]}"
+    echo "  Embedding: $EMBED_STR"
+    MAKE_ARGS+=(EXTRA_FILES="$EMBED_STR")
 fi
+
+if [[ ${#RUN_FILES[@]} -gt 0 ]]; then
+    RUN_STR="${RUN_FILES[*]}"
+    echo "  QEMU files: $RUN_STR"
+    MAKE_ARGS+=(RUN_FILES="$RUN_STR")
+fi
+
+exec make "${MAKE_ARGS[@]}"
