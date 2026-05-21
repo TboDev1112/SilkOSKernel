@@ -50,7 +50,8 @@ void vga_redir_end(void);
 void vga_redir_clear(void);
 void vga_update_cursor(void);
 
-void kernel_panic(const char *msg);
+#include "kernel/panic.h"
+
 void kernel_request_halt(void);
 bool kernel_is_running(void);
 

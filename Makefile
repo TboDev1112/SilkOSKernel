@@ -37,10 +37,13 @@ endif
 CFLAGS  += -fno-stack-protector -fno-pie -fno-pic
 LDFLAGS += -no-pie
 
-CMD_SRCS  := $(wildcard cmd/*.c)
-CMD_OBJS  := $(CMD_SRCS:cmd/%.c=cmd/%.o)
+CMD_SRCS    := $(wildcard cmd/*.c)
+CMD_OBJS    := $(CMD_SRCS:cmd/%.c=cmd/%.o)
 
-BASE_OBJS := boot.o kernel.o silk_fs.o files_table.o $(CMD_OBJS)
+KERNEL_SRCS := kernel.c $(wildcard kernel/*.c)
+KERNEL_OBJS := $(KERNEL_SRCS:.c=.o)
+
+BASE_OBJS := boot.o $(KERNEL_OBJS) silk_fs.o files_table.o $(CMD_OBJS)
 
 FILE_OBJS := $(addsuffix .embed.o,$(EXTRA_FILES))
 
@@ -52,6 +55,9 @@ boot.o: boot.asm
 	$(AS) -f elf64 $< -o $@
 
 kernel.o: kernel.c kernel.h cmd/cmd.h silk_fs.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+kernel/%.o: kernel/%.c kernel.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 silk_fs.o: silk_fs.c silk_fs.h kernel.h
@@ -139,7 +145,7 @@ debug: $(KERNEL)
 	    --no-reboot
 
 clean:
-	rm -f boot.o kernel.o silk_fs.o files_table.o $(CMD_OBJS) $(KERNEL) $(KERNEL).elf64 $(ISO)
+	rm -f boot.o $(KERNEL_OBJS) silk_fs.o files_table.o $(CMD_OBJS) $(KERNEL) $(KERNEL).elf64 $(ISO)
 	rm -f files_table.c .files_list
 	rm -f *.embed.o
 	rm -rf $(ISODIR)
