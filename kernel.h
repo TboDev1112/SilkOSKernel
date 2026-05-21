@@ -28,6 +28,7 @@
 #define KEY_DOWN     0x101
 #define KEY_LEFT     0x102
 #define KEY_RIGHT    0x103
+#define KEY_CTRL_C   0x03
 #define KEY_CTRL_J   0x104
 #define KEY_CTRL_T   0x105
 
@@ -65,5 +66,6 @@ void   kmemcpy(void *dst, const void *src, size_t n);
 void   kputs_sz(size_t v);
 
 int kb_getkey(void);
+int kb_poll(void);
 
 void shell_execute(const char *line);

@@ -34,3 +34,4 @@ void cmd_beep(void);
 void cmd_files(void);
 void cmd_exec(void);
 void cmd_render(void);
+void cmd_rndm(void);

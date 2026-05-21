@@ -10,6 +10,16 @@ typedef struct {
     const uint8_t  *pixels;
 } PpmImage;
 
+typedef struct {
+    size_t   x0;
+    size_t   y0;
+    uint32_t draw_w;
+    uint32_t draw_h;
+} RenderRect;
+
+#define CANVAS_W      VGA_COLS
+#define CANVAS_H      (VGA_ROWS * 2)
+
 static inline uint16_t vga_cell(char c, uint8_t fg, uint8_t bg) {
     return (uint16_t)(uint8_t)c | ((uint16_t)((bg << 4) | (fg & 0x0F)) << 8);
 }
@@ -91,8 +101,8 @@ static bool ppm_parse(const uint8_t *data, size_t size, PpmImage *img) {
     return img->width > 0 && img->height > 0;
 }
 
-static void ppm_sample(const PpmImage *img, bool color, uint32_t x, uint32_t y,
-                       uint8_t *r, uint8_t *g, uint8_t *b) {
+static void ppm_pixel(const PpmImage *img, bool color, uint32_t x, uint32_t y,
+                      uint8_t *r, uint8_t *g, uint8_t *b) {
     if (x >= img->width)  x = img->width  ? img->width  - 1 : 0;
     if (y >= img->height) y = img->height ? img->height - 1 : 0;
 
@@ -111,20 +121,106 @@ static void ppm_sample(const PpmImage *img, bool color, uint32_t x, uint32_t y,
     }
 }
 
+static void region_average(const PpmImage *img, bool color,
+                           uint32_t x0, uint32_t x1, uint32_t y0, uint32_t y1,
+                           uint8_t *r, uint8_t *g, uint8_t *b) {
+    if (x0 >= img->width)  x0 = img->width  ? img->width  - 1 : 0;
+    if (y0 >= img->height) y0 = img->height ? img->height - 1 : 0;
+    if (x1 <= x0) x1 = x0 + 1;
+    if (y1 <= y0) y1 = y0 + 1;
+    if (x1 > img->width)  x1 = img->width;
+    if (y1 > img->height) y1 = img->height;
+
+    uint32_t sr = 0, sg = 0, sb = 0, n = 0;
+    for (uint32_t y = y0; y < y1; y++) {
+        for (uint32_t x = x0; x < x1; x++) {
+            uint8_t pr, pg, pb;
+            ppm_pixel(img, color, x, y, &pr, &pg, &pb);
+            sr += pr;
+            sg += pg;
+            sb += pb;
+            n++;
+        }
+    }
+
+    if (!n) {
+        *r = *g = *b = 0;
+        return;
+    }
+    *r = (uint8_t)(sr / n);
+    *g = (uint8_t)(sg / n);
+    *b = (uint8_t)(sb / n);
+}
+
+static RenderRect render_fit_rect(const PpmImage *img) {
+    RenderRect rc;
+    uint32_t dw = img->width;
+    uint32_t dh = img->height;
+
+    if (dw > CANVAS_W || dh > CANVAS_H) {
+        uint64_t scale_w = ((uint64_t)CANVAS_W << 16) / dw;
+        uint64_t scale_h = ((uint64_t)CANVAS_H << 16) / dh;
+        uint64_t scale   = scale_w < scale_h ? scale_w : scale_h;
+        dw = (uint32_t)(((uint64_t)dw * scale) >> 16);
+        dh = (uint32_t)(((uint64_t)dh * scale) >> 16);
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+    }
+
+    rc.draw_w = dw;
+    rc.draw_h = dh;
+    rc.x0     = (CANVAS_W - dw) / 2;
+    rc.y0     = (CANVAS_H - dh) / 2;
+    return rc;
+}
+
+static void render_clear_screen(void) {
+    for (size_t i = 0; i < VGA_COLS * VGA_ROWS; i++)
+        vga_buf[i] = vga_cell(' ', CLR_BLACK, CLR_BLACK);
+}
+
 static void render_ppm_to_vga(const PpmImage *img, bool color) {
-    const size_t out_w = VGA_COLS;
-    const size_t out_h = VGA_ROWS * 2;
+    RenderRect fit = render_fit_rect(img);
+
+    render_clear_screen();
 
     for (size_t row = 0; row < VGA_ROWS; row++) {
         for (size_t col = 0; col < VGA_COLS; col++) {
-            uint32_t x0 = (uint32_t)((col * img->width) / out_w);
-            uint32_t y_top = (uint32_t)((row * 2) * img->height / out_h);
-            uint32_t y_bot = (uint32_t)((row * 2 + 1) * img->height / out_h);
-            if (y_bot == y_top && y_top + 1 < img->height) y_bot = y_top + 1;
+            uint32_t ox = (uint32_t)col;
+            uint32_t oy_top = (uint32_t)(row * 2);
+            uint32_t oy_bot = oy_top + 1;
 
-            uint8_t r0, g0, b0, r1, g1, b1;
-            ppm_sample(img, color, x0, y_top, &r0, &g0, &b0);
-            ppm_sample(img, color, x0, y_bot, &r1, &g1, &b1);
+            bool in_top = ox >= fit.x0 && ox < fit.x0 + fit.draw_w &&
+                          oy_top >= fit.y0 && oy_top < fit.y0 + fit.draw_h;
+            bool in_bot = ox >= fit.x0 && ox < fit.x0 + fit.draw_w &&
+                          oy_bot >= fit.y0 && oy_bot < fit.y0 + fit.draw_h;
+
+            if (!in_top && !in_bot) continue;
+
+            uint8_t r0 = 0, g0 = 0, b0 = 0, r1 = 0, g1 = 0, b1 = 0;
+
+            if (in_top) {
+                uint32_t lx = ox - (uint32_t)fit.x0;
+                uint32_t ly = oy_top - (uint32_t)fit.y0;
+                uint32_t sx0 = (lx * img->width) / fit.draw_w;
+                uint32_t sx1 = ((lx + 1) * img->width) / fit.draw_w;
+                uint32_t sy0 = (ly * img->height) / fit.draw_h;
+                uint32_t sy1 = ((ly + 1) * img->height) / fit.draw_h;
+                region_average(img, color, sx0, sx1, sy0, sy1, &r0, &g0, &b0);
+            }
+
+            if (in_bot) {
+                uint32_t lx = ox - (uint32_t)fit.x0;
+                uint32_t ly = oy_bot - (uint32_t)fit.y0;
+                uint32_t sx0 = (lx * img->width) / fit.draw_w;
+                uint32_t sx1 = ((lx + 1) * img->width) / fit.draw_w;
+                uint32_t sy0 = (ly * img->height) / fit.draw_h;
+                uint32_t sy1 = ((ly + 1) * img->height) / fit.draw_h;
+                region_average(img, color, sx0, sx1, sy0, sy1, &r1, &g1, &b1);
+            }
+
+            if (!in_top) { r0 = r1; g0 = g1; b0 = b1; }
+            if (!in_bot) { r1 = r0; g1 = g0; b1 = b0; }
 
             uint8_t fg = rgb_to_vga(r0, g0, b0);
             uint8_t bg = rgb_to_vga(r1, g1, b1);

@@ -580,6 +580,7 @@ int kb_getkey(void) {
 
     char c = kb_shift ? sc_shift[sc] : sc_normal[sc];
 
+    if (kb_ctrl && (c == 'c' || c == 'C')) return KEY_CTRL_C;
     if (kb_ctrl && (c == 'j' || c == 'J')) return KEY_CTRL_J;
     if (kb_ctrl && (c == 't' || c == 'T')) return KEY_CTRL_T;
     if (kb_ctrl) return 0;
@@ -589,6 +590,16 @@ int kb_getkey(void) {
     if (kb_caps && c >= 'A' && c <= 'Z' && !kb_shift) c = (char)(c + 32);
 
     return c;
+}
+
+static bool kb_ready(void) {
+    uint8_t st = inb(0x64);
+    return (st & 0x01) && !(st & 0x20);
+}
+
+int kb_poll(void) {
+    if (!kb_ready()) return 0;
+    return kb_getkey();
 }
 
 

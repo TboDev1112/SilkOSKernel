@@ -22,6 +22,7 @@ const Command commands[] = {
     { "files",     "List files bundled into this kernel image",     cmd_files },
     { "exec",      "Run an embedded ELF64 binary: exec <name>",     cmd_exec },
     { "render",    "Draw a PPM image on screen: render <file.ppm>", cmd_render },
+    { "rndm",      "Stream random Unicode until Ctrl+C",          cmd_rndm },
 };
 
 const size_t cmd_count = sizeof(commands) / sizeof(commands[0]);

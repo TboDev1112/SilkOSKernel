@@ -187,7 +187,7 @@ static const char sc_shift[128] = {
 
 static uint8_t kb_ext_pending = 0;
 
-static int kb_poll(void) {
+static int sx_kb_poll(void) {
     uint8_t st = inb(0x64);
     if (!(st & 0x01) || (st & 0x20)) return 0;
     uint8_t sc = inb(0x60);
@@ -267,7 +267,7 @@ void cmd_sxgui(void) {
             moved = true;
         }
 
-        int key = kb_poll();
+        int key = sx_kb_poll();
 
         if (key == KEY_CTRL_J) {
             vga_put_cell(cx, cy, under);

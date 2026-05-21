@@ -60,16 +60,18 @@ done
 
 MAKE_ARGS=("${ARGS[@]}")
 
-if [[ ${#EMBED_FILES[@]} -gt 0 ]]; then
-    EMBED_STR="${EMBED_FILES[*]}"
-    echo "  Embedding: $EMBED_STR"
-    MAKE_ARGS+=(EXTRA_FILES="$EMBED_STR")
-fi
-
+COMBINED_EMBED=("${EMBED_FILES[@]}")
 if [[ ${#RUN_FILES[@]} -gt 0 ]]; then
     RUN_STR="${RUN_FILES[*]}"
     echo "  QEMU files: $RUN_STR"
     MAKE_ARGS+=(RUN_FILES="$RUN_STR")
+    COMBINED_EMBED+=("${RUN_FILES[@]}")
+fi
+
+if [[ ${#COMBINED_EMBED[@]} -gt 0 ]]; then
+    EMBED_STR="${COMBINED_EMBED[*]}"
+    echo "  Embedding: $EMBED_STR"
+    MAKE_ARGS+=(EXTRA_FILES="$EMBED_STR")
 fi
 
 exec make "${MAKE_ARGS[@]}"
