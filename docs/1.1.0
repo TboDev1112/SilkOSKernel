@@ -1,0 +1,1 @@
+Added an image renderer and /dev/urandom equivalent. Also added passing through any files.
